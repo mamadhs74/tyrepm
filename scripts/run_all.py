@@ -293,7 +293,6 @@ class PMModel(nn.Module):
 # ────────────────────────────────────────────────────────────────────────────
 
 
-torch.manual_seed(42)                         # reproducible NN runs
 
 WIN          = 128          # sequence length (was 1024 → halves GPU load)
 BATCH_SIZE   = 16          # DataLoader batches (was 32)
@@ -308,6 +307,19 @@ STABLE_MODE = False   # ← flip to False to go back to your normal settings
 EXPERIMENT_SSL = True   # False = disable SSL (baseline). True = enable SSL.
 SEED = 42               # run the script with SEED=41,42,43 and compare
 MASK_RATE = 0.20        # % of feature dims to mask in SSL losses
+# ---- Augmentation knobs (z-scored feature space) ----
+AUG_NOISE_STD  = 0.02   # small Gaussian noise on a few features
+KO1_JITTER_STD = 0.05   # extra jitter ONLY on KO1_[km\h]
+JITTER_KO1     = True   # quick on/off switch
+
+# gentler when stabilizing
+if STABLE_MODE:
+    AUG_NOISE_STD  = 0.00
+    KO1_JITTER_STD = 0.02
+
+# features eligible for the generic noise
+AUG_COLS = ["KO1_[km\\h]","Pitch_Angle_[Grad]","BR5_Bremsdruck_[bar]",
+            "Heading_rate_[deg_s]","Curvature_[1_m]"]
 
 
 if STABLE_MODE:
@@ -322,9 +334,9 @@ else:
 MAX_GRAD_SERIES   = 25         # plot at most this many parameter series
 GRAD_LOG_EVERY    = 10         # record one grad point every N steps
 TRACKED_PARAM_PATTERNS = [
-    r"__global__",             # always keep global curve
-    r"\bgate\.log_g\b",        # gate weights
-    r"\bencoder\.tcn\.0\.conv1\.weight\b",  # one early conv as a proxy
+    r"__global__",
+    r"\bgate\.log_g\b",
+    r"\bencoder\.tcn\.tcn\.0\.conv1\.weight\b",
 ]
 
 # (optional but recommended) reproducibility
@@ -342,7 +354,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print("🔌  using", DEVICE.upper())
 
 # ——————————————————————————————————————— 1. load data
-df = pd.read_csv("data/raw/1.csv")
+df = pd.read_csv("1.csv")
 TICK_RATE            = 0.1     # logger tick [s]
 DRY_ASPHALT_BASE_MU  = 1.2
 USE_DYNAMIC_MU       = False   # still honoured for temp-μ, slip-μ always applied
@@ -420,7 +432,6 @@ SELECTED = [
     "BR2_Querbeschl_[m/s²]",
     "Slip_Angle_[Grad]",
     "slip_x_speed",
-    "DSN",
     "mu_final",
     "BR5_Giergeschw_[Grad\\s]",
     "BR5_Bremsdruck_[bar]",
@@ -498,8 +509,8 @@ else:
 
 # --- GPS-only speed from positions (independent of KO1) ---
 # Robust 2D speed (m/s) from Web-Mercator coords and tick rate
-dx = df["X_m"].diff().fillna(0.0)
-dy = df["Y_m"].diff().fillna(0.0)
+dx = df["X_m"].diff().clip(-15, 15).fillna(0.0)
+dy = df["Y_m"].diff().clip(-15, 15).fillna(0.0)
 df["V_xy_ms"] = np.hypot(dx, dy) / TICK_RATE
 df["V_xy_ms"] = df["V_xy_ms"].ewm(alpha=0.5, adjust=False).mean()
 
@@ -518,16 +529,18 @@ else:
 # Robust heading column (creates df["Heading_deg"] if it wasn't there)
 # --------------------------------------------------------------------
 if "Heading_deg" not in df.columns:
-    if "Heading" in df.columns:                       # your own heading
+    if "Heading" in df.columns:
         df["Heading_deg"] = df["Heading"].astype(float)
-    elif "True_Heading_[Grad]" in df.columns:         # FMS heading
+    elif "True_Heading_[Grad]" in df.columns:
         df["Heading_deg"] = df["True_Heading_[Grad]"].astype(float)
     else:
-        print("[WARN] no heading column found – assuming 0° north")
-        df["Heading_deg"] = 0.0
+        # derive heading from filtered XY increments (uses dx, dy from above)
+        df["Heading_deg"] = np.rad2deg(np.arctan2(dy, dx))
+        df["Heading_deg"] = df["Heading_deg"].bfill().fillna(0.0)
 
 # unwrap once so later curvature calc still works
 df["Heading_unwrapped"] = np.unwrap(np.deg2rad(df["Heading_deg"]))
+
 
 
 # ───────── 3-step: tiny EKF to smooth XY & heading  ────────────────────────
@@ -536,15 +549,7 @@ df["Heading_unwrapped"] = np.unwrap(np.deg2rad(df["Heading_deg"]))
 dt = TICK_RATE
 
 if HAS_FILTERPY:
-    # --- EKF helpers (same as your earlier version) ---
-    def H_jacobian(x):
-        return np.array([[1., 0., 0., 0., 0.],
-                         [0., 1., 0., 0., 0.],
-                         [0., 0., 1., 0., 0.]], dtype=float)
-
-    def h_of_x(x):
-        return x[:3]
-
+    # --- motion model (same kinematics you had) ---
     def f(x, dt):
         x_new = np.copy(x)
         v, psi, r = x[2], x[3], x[4]
@@ -565,7 +570,20 @@ if HAS_FILTERPY:
             F[:, i] = (f(xp, dt) - f(xm, dt)) / (2*eps)
         return F
 
-    ekf = ExtendedKalmanFilter(dim_x=5, dim_z=3)
+    # --- measurement models (separate updates) ---
+    def Hxy(x): return np.array([x[0], x[1]], dtype=float)  # position
+    def Hv(x):  return np.array([x[2]], dtype=float)        # speed
+    def Hr(x):  return np.array([x[4]], dtype=float)        # yaw-rate (optional)
+
+    def Hxy_jac(x):
+        return np.array([[1.,0.,0.,0.,0.],
+                         [0.,1.,0.,0.,0.]], dtype=float)
+    def Hv_jac(x):
+        return np.array([[0.,0.,1.,0.,0.]], dtype=float)
+    def Hr_jac(x):
+        return np.array([[0.,0.,0.,0.,1.]], dtype=float)
+
+    ekf = ExtendedKalmanFilter(dim_x=5, dim_z=2)  # we'll pass R per update
 
     v0 = (df["V_gps_ms"].replace(0, np.nan).dropna().iloc[0]
           if df["V_gps_ms"].replace(0, np.nan).dropna().size else 0.05)
@@ -580,25 +598,50 @@ if HAS_FILTERPY:
 
     ekf.P = np.eye(5) * 10.0
     ekf.Q = np.diag([0.2, 0.2, 0.5, np.deg2rad(2), np.deg2rad(5)])**2
-    ekf.R = np.diag([3.0, 3.0, 0.8])**2
+
+    # measurement std-devs (tune if needed)
+    sx, sy   = 3.0, 3.0     # meters, GPS position
+    sv_gps   = 0.30         # m/s, GPS speed (or diff’d pos)
+    sr_gyro  = np.deg2rad(1.5)  # rad/s, yaw-rate if you have it
 
     F_straight = np.eye(5)
-    SPEED_COL = "Velocity_[km\\h]" if "Velocity_[km\\h]" in df.columns else "KO1_[km\\h]"
-    gps_arr = df[["X_m", "Y_m", SPEED_COL]].to_numpy(float)
 
     state_out = []
-    for x_gps, y_gps, v_kmh in gps_arr:
+    for i, (x_gps, y_gps, v_ms) in enumerate(df[["X_m", "Y_m", "V_gps_ms"]].to_numpy(float)):
+        # --- predict
         Fk = F_straight if abs(ekf.x[4]) < 1e-4 else F_jac(ekf.x, dt)
-        x_pred = f(ekf.x, dt)
-        P_pred = Fk @ ekf.P @ Fk.T + ekf.Q
-        ekf.x, ekf.P = x_pred, P_pred
+        ekf.x = f(ekf.x, dt)
+        ekf.P = Fk @ ekf.P @ Fk.T + ekf.Q
 
-        z = np.array([x_gps, y_gps, v_kmh/3.6], dtype=float)
-        ekf.update(z, HJacobian=H_jacobian, Hx=h_of_x)
+        # --- update position (always)
+        ekf.update(
+            np.array([x_gps, y_gps], dtype=float),
+            HJacobian=Hxy_jac, Hx=Hxy,
+            R=np.diag([sx**2, sy**2])
+        )
+
+        # --- update speed-over-ground (skip/loosen near standstill)
+        if v_ms >= 0.5:
+            ekf.update(np.array([v_ms], dtype=float),
+                       HJacobian=Hv_jac, Hx=Hv,
+                       R=np.array([[sv_gps**2]]))
+        else:
+            ekf.update(np.array([v_ms], dtype=float),
+                       HJacobian=Hv_jac, Hx=Hv,
+                       R=np.array([[(3.0*sv_gps)**2]]))
+
+        # --- optional yaw-rate fusion if available
+        if "BR5_Giergeschw_[Grad\\s]" in df.columns:
+            r_meas = np.deg2rad(float(df.at[i, "BR5_Giergeschw_[Grad\\s]"]))
+            ekf.update(np.array([r_meas], dtype=float),
+                       HJacobian=Hr_jac, Hx=Hr,
+                       R=np.array([[sr_gyro**2]]))
+
         state_out.append(ekf.x.copy())
 
     state_out = np.vstack(state_out)
     df["X_f"], df["Y_f"], df["V_f"], df["Psi_f"], df["r_f"] = state_out.T
+
 
 else:
     # Fallback: causal smoothing + finite differences
@@ -735,7 +778,7 @@ for loc in ["Front", "Rear"]:
         df[f"Wheel_Speed_Diff_{loc}"] = df[l] - df[r]
 
 # 2-b  physics block – load transfer, μ, friction force ----------------------
-g             = 9.80665
+G             = 9.80665
 tire_radius   = (457.2 + 2*114.75)/2000           # ~0.343 m for 255/45 R18
 probe_height  = 0.13                              # PM probe height [m]
 weights       = {"Front_Left":681, "Front_Right":630,
@@ -744,7 +787,7 @@ vehicle_mass  = sum(weights.values())
 L             = 3.0                               # wheel-base [m]
 h_cg          = (weights["Rear_Left"]+weights["Rear_Right"])*L/(vehicle_mass*2)
 track_front   = (1622+1634)/2000 + 0.06
-static_FR     = weights["Front_Right"] * g
+static_FR     = weights["Front_Right"] * G
 FR_share      = weights["Front_Right"]/(weights["Front_Left"]+weights["Front_Right"])
 
 df["deltaFz_long"]      = df["a_long"] * vehicle_mass * h_cg / L
@@ -807,8 +850,8 @@ df["slip_energy"] = (df["Slip_Angle_[Grad]"].abs()
 # ----------  Regime-feature scaffold  ---------------------------------
 g = 9.80665                                      # gravity
 
-df["lambda_x"] = df["a_long"] / (df["mu_final"]*g)      # signed long. demand
-df["lambda_y"] = df["a_lat"]  / (df["mu_final"]*g)      # lateral demand
+df["lambda_x"] = df["a_long"] / (df["mu_final"]*G)      # signed long. demand
+df["lambda_y"] = df["a_lat"]  / (df["mu_final"]*G)      # lateral demand
 
 df["slip_power"] = (                                    # |α|·F  ≈ tread work
     df["Slip_Angle_[Grad]"].abs() *
@@ -847,8 +890,8 @@ else:
     df["Slip_Ratio_Avg"] = 0.0
 
 # final friction utilisation ---------------------------------------------------
-df["Friction_Utilization"] = np.sqrt((df["a_long"]/(df["mu_final"]*g))**2 +
-                                     (df["a_lat"] /(df["mu_final"]*g))**2)
+df["Friction_Utilization"] = np.sqrt((df["a_long"]/(df["mu_final"]*G))**2 +
+                                     (df["a_lat"] /(df["mu_final"]*G))**2)
 
 # —— physical sanity guards ---------------------------------------------------
 viol = df['Friction_Utilization'] > 1.30
@@ -1541,7 +1584,7 @@ gate_init_vec = 0.2 + 0.8 * corr_norm  # keep >0 to avoid dead gates
 
 # === REPLACE OLD SUPERVISED TCN TRAINING WITH THIS =========================
 # === SELF-/SEMI-SUPERVISED FINETUNE (robust + SSL aux) =====================
-pm_model = PMModel(n_feat=X.shape[-1], channels=CHANNELS, kernel_size=5, dropout=0.05).to(DEVICE)
+pm_model = PMModel(n_feat=X.shape[-1], channels=CHANNELS, kernel_size=5, dropout=0.10).to(DEVICE)
 register_nan_hooks(pm_model, name="PMModel")
 
 # apply data-driven init to gates
@@ -1559,35 +1602,29 @@ pm_model.ssl_aux.load_state_dict(ssl_head.state_dict())
 
 
 # optional warm start: freeze encoder for a few epochs
+# optional warm start: freeze encoder for a longer period
 for p in pm_model.encoder.parameters():
     p.requires_grad = False
-WARM_EPOCHS = 3
+WARM_EPOCHS = 15
 
 # two LR param groups; encoder gets a smaller LR after unfreeze
 optim = torch.optim.Adam([
-    {"params": pm_model.gate.parameters(),    "lr": 3e-5, "weight_decay": 2e-5},
-    {"params": pm_model.head.parameters(),    "lr": 3e-5, "weight_decay": 2e-5},
-    {"params": pm_model.encoder.parameters(), "lr": 5e-6, "weight_decay": 1e-5},
+    {"params": pm_model.gate.parameters(),    "lr": 3e-5, "weight_decay": 5e-5},
+    {"params": pm_model.head.parameters(),    "lr": 3e-5, "weight_decay": 5e-5},
+    {"params": pm_model.encoder.parameters(), "lr": 1e-6, "weight_decay": 2e-5},
 ])
 
 
 loss_fn   = nn.MSELoss()
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=EPOCHS, eta_min=1e-6)
 
-# Base settings
-L1_GATES = 1e-4                # gate sparsity (default)
-ALPHA_SSL_START = 0.4           # SSL weight schedule (default)
-ALPHA_SSL_END   = 0.1
-
-# ---- STABLE_MODE overrides ----
-if STABLE_MODE:
-    L1_GATES = 1e-4             # let gates open more easily
-    ALPHA_SSL_START = 0.0       # disable SSL influence while stabilizing
-    ALPHA_SSL_END   = 0.0
-# === [NEW] Hard override for SSL ablation ===
-# Always: use SSL for pretrain; turn it OFF for fine-tune (supervised stability)
+# Fine-tune SSL is always off (we only use SSL for pretraining)
 ALPHA_SSL_START = 0.0
 ALPHA_SSL_END   = 0.0
+
+# Gate sparsity: stronger by default; softer when stabilizing
+L1_GATES = 1e-4 if STABLE_MODE else 5e-4
+
 
 # ============================================
 
@@ -1631,15 +1668,26 @@ for epoch in range(1, EPOCHS + 1):
         train_batches = 0
 
         for xb, yb, wb, xb_next in train_loader:
+
+            # (A) augmentation — training only
             if (not AUG_DISABLED) and pm_model.training:
-                noise_std = 0.02
-                aug_cols = ["KO1_[km\\h]", "Pitch_Angle_[Grad]", "BR2_Querbeschl_[m/s²]",
-                            "Heading_rate_[deg_s]", "Curvature_[1_m]"]
-                aug_idx = [SELECTED.index(c) for c in aug_cols if c in SELECTED]
-                if aug_idx:
-                    mask = torch.zeros(1, 1, n_feat, device=xb.device)
-                    mask[..., aug_idx] = 1.0
-                    xb = xb + mask * torch.randn_like(xb) * noise_std
+                scale = aug_scale(epoch) if 'aug_scale' in globals() else 1.0
+                aug_idx = [SELECTED.index(c) for c in AUG_COLS if c in SELECTED]
+
+                with torch.no_grad():
+                    # generic masked Gaussian noise on a few features
+                    if aug_idx and AUG_NOISE_STD > 0:
+                        mask = torch.zeros(1, 1, n_feat, device=xb.device)
+                        mask[..., aug_idx] = 1.0
+                        xb.add_(mask * torch.randn_like(xb) * (AUG_NOISE_STD * scale))
+
+                    # KO1-only jitter
+                    if JITTER_KO1 and ("KO1_[km\\h]" in SELECTED) and KO1_JITTER_STD > 0:
+                        j = SELECTED.index("KO1_[km\\h]")
+                        xb[..., j].add_(KO1_JITTER_STD * scale * torch.randn_like(xb[..., j]))
+
+
+
 
             xb, yb, wb = xb.to(DEVICE), yb.to(DEVICE), wb.to(DEVICE)
             xb = torch.nan_to_num(xb); yb = torch.nan_to_num(yb)
@@ -2016,9 +2064,10 @@ from sklearn.metrics import mean_absolute_error
 base_mae = mean_absolute_error(y_true_full[mask_eval], base_pred_full[mask_eval])
 print(f"[LOFO] baseline MAE (TEST real-only) = {base_mae:.3f}")
 
-def permute_time(arr):
+def permute_within_mask(arr: np.ndarray, row_mask: np.ndarray, rng):
     a = arr.copy()
-    rng.shuffle(a)  # breaks time-feature link but preserves marginal dist.
+    idx = np.flatnonzero(row_mask)
+    rng.shuffle(a[idx])  # shuffle only within the test rows
     return a
 
 delta_mae = {}
@@ -2026,8 +2075,8 @@ for f in SELECTED:
     if f not in df.columns:   # safety
         continue
     df_tmp = df.copy()
-    # Option A: time permutation (recommended)
-    df_tmp[f] = permute_time(df_tmp[f].to_numpy())
+    df_tmp[f] = permute_within_mask(df_tmp[f].to_numpy(), test_row_mask, rng)
+
     # Option B: median freeze (sensitivity)
     # df_tmp[f] = np.nanmedian(df_tmp[f].to_numpy())
 
