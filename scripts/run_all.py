@@ -1701,7 +1701,7 @@ for epoch in range(1, EPOCHS + 1):
 
             w_eff = wb
             per_elem = F.smooth_l1_loss(pred_z, yb, beta=1.0, reduction="none")
-            sup_loss = (w_eff * per_elem).mean()
+            sup_loss = (w_eff * per_elem).sum() / (w_eff.sum() + 1e-8)
             # ---- Masked Feature Modeling (score only masked feature dims) ----
             xb_next_ = xb_next.to(DEVICE)                 # (B, F)
             with torch.no_grad():
@@ -1775,7 +1775,7 @@ for epoch in range(1, EPOCHS + 1):
         # use tensors already built above: val_pred_z, val_true_z, and numpy val_w
         val_per_elem = F.smooth_l1_loss(val_pred_z, val_true_z, beta=1.0, reduction="none")
         val_w_t = torch.from_numpy(val_w).to(val_per_elem.device).float()
-        val_sup = (val_w_t * val_per_elem).mean().item()
+        val_sup = ((val_w_t * val_per_elem).sum() / (val_w_t.sum() + 1e-8)).item()
 
         # --- log epoch means ---
         m_total = epoch_total / max(1, train_batches)
@@ -1858,23 +1858,29 @@ MODEL_PM = pm_model.eval() # finished network
 
 @torch.no_grad()
 def tcn_predict_series(df_src: pd.DataFrame, feature_cols=SELECTED, win=TRAIN_WIN):
+    # 1) same preprocessing as training
     feats = df_src[feature_cols].fillna(0).to_numpy(np.float32)
     feats = SCALER.transform(feats)
+    feats = np.clip(feats, -6.0, 6.0)  # mirror training clip
 
-    if feats.shape[0] < win:
+    # need at least (win + 1) rows to produce the first next-step prediction
+    if feats.shape[0] <= win:
         return np.full(len(df_src), np.nan, dtype=float)
 
-    X_tmp = np.stack([feats[i - win + 1:i + 1, :] for i in range(win - 1, len(feats))]).astype(np.float32)
+    # 2) windows are [i : i+win) → model predicts target at (i+win)
+    X_tmp = np.stack([feats[i:i+win, :] for i in range(0, len(feats) - win)]).astype(np.float32)
     ds = DataLoader(TensorDataset(torch.from_numpy(X_tmp)), batch_size=256, shuffle=False)
 
+    # 3) run model and inverse-scale
     pred_z = torch.cat([MODEL_PM(b.to(DEVICE))[0].cpu() for (b,) in ds]).numpy()
     pred   = Y_SCALER.inverse_transform(pred_z.reshape(-1, 1)).ravel()
 
+    # 4) write predictions at indices [win :] (because label is at i+win)
     full = np.full(len(df_src), np.nan, dtype=float)
-    full[np.arange(win - 1, len(df_src))] = pred
+    full[win:] = pred
     return full
-
-
+pred_full = tcn_predict_series(df, feature_cols=SELECTED, win=TRAIN_WIN)
+print("first finite pred index:", np.flatnonzero(np.isfinite(pred_full))[0])  # should be == TRAIN_WIN
 
 # Show learned feature weights (the “importance” your model discovered)
 # Show learned feature weights (the “importance” your model discovered)
@@ -1888,10 +1894,10 @@ with torch.no_grad():
 # Align to SELECTED and save/print
 idx_names = SELECTED[:len(gate_vals)]
 gate_series = pd.Series(gate_vals[:len(idx_names)], index=idx_names).sort_values(ascending=False)
+gate_series.name = "gate"  # give the Series a column name
 print("\nTop learned feature weights (gates):\n", gate_series.head(12))
 out_csv = "ml_charts/diagnostics/learned_feature_gates.csv"
-gate_series.to_csv(out_csv)
-print(f"[gates] saved → {out_csv}")
+gate_series.to_csv(out_csv, header=True)
 
 
 # ============================================================================
@@ -2052,7 +2058,7 @@ base_pred_full = df_pred["PM10_hat_all"].to_numpy(np.float32)
 # Map window split to row-index split: window i → row (i + WIN - 1)
 # We already defined: split = int(0.8 * len(X)) earlier for TCN windows
 n_rows = len(df)
-test_start_row = TRAIN_WIN - 1 + i_va
+test_start_row = TRAIN_WIN + i_va
 test_row_mask = np.zeros(n_rows, dtype=bool)
 if test_start_row < n_rows:
     test_row_mask[test_start_row:] = True
