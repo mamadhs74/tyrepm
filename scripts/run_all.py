@@ -312,6 +312,12 @@ AUG_NOISE_STD  = 0.02   # small Gaussian noise on a few features
 KO1_JITTER_STD = 0.05   # extra jitter ONLY on KO1_[km\h]
 JITTER_KO1     = True   # quick on/off switch
 
+
+# --- augmentation schedule helper (prevents Pylance "aug_scale" warning) ---
+def aug_scale(epoch: int, total: int = EPOCHS) -> float:
+    """Return multiplicative factor for augmentation intensity.
+    Keep 1.0 for now; replace with a schedule later if you like."""
+    return 1.0
 # gentler when stabilizing
 if STABLE_MODE:
     AUG_NOISE_STD  = 0.00
@@ -1899,6 +1905,11 @@ print("\nTop learned feature weights (gates):\n", gate_series.head(12))
 out_csv = "ml_charts/diagnostics/learned_feature_gates.csv"
 gate_series.to_csv(out_csv, header=True)
 
+mu_gate = float(gate_series.get("mu_final", np.nan))
+if np.isfinite(mu_gate):
+    print(f"[GATE] mu_final = {mu_gate:.6f}")
+else:
+    print("[GATE] mu_final not found in learned gates (check SELECTED)")
 
 # ============================================================================
 def log_gradient_norms(grad_history, out_path, max_series=25):
@@ -2048,6 +2059,197 @@ def audit_coverage(df_src, df_pred_src, WIN, test_frac=0.2):
 df_pred["PM10_hat_all"] = tcn_predict_series(df, feature_cols=SELECTED, win=TRAIN_WIN)
 audit_coverage(df, df_pred, WIN)
 
+# ========================= SANITY CHECK SUITE =========================
+from sklearn.metrics import mean_absolute_error
+import numpy as np, pandas as pd, os, matplotlib.pyplot as plt
+
+SANITY_DIR = "ml_charts/diagnostics/sanity"
+os.makedirs(SANITY_DIR, exist_ok=True)
+
+# --- 0) helper: map window indices → row masks (for fair splits)
+def split_row_masks_from_windows(n_win, win, i_tr, i_va, horizon=1, n_rows=None):
+    # label row for window j is j + win + horizon - 1 (here horizon=1)
+    lab = np.arange(n_win) + (win + horizon - 1)
+    train_mask = np.zeros(n_rows, bool)
+    val_mask   = np.zeros(n_rows, bool)
+    test_mask  = np.zeros(n_rows, bool)
+    train_mask[lab[:i_tr]]        = True
+    val_mask[lab[i_tr:i_va]]      = True
+    test_mask[lab[i_va:]]         = True
+    return train_mask, val_mask, test_mask
+
+# recover window counts & row masks from objects you already built
+n_win = len(X)                           # number of TCN windows you produced
+train_rows, val_rows, test_rows = split_row_masks_from_windows(
+    n_win, TRAIN_WIN, i_tr, i_va, horizon=HORIZON, n_rows=len(df)
+)
+
+# mask where we have real labels and finite preds
+y_col = "PM10_shifted"
+y_true_full = df[y_col].to_numpy(np.float32)
+y_mask_real = (df[f"{y_col}_mask"].to_numpy(np.float32) > 0.5)
+
+# you already wrote full-series TCN predictions into df_pred["PM10_hat_all"]
+y_pred_full = df_pred["PM10_hat_all"].to_numpy(np.float32)
+
+def safe_mae(y_true, y_pred, m):
+    m = m & np.isfinite(y_true) & np.isfinite(y_pred)
+    return mean_absolute_error(y_true[m], y_pred[m]) if m.any() else np.nan
+
+# --- 1) Overfitting check: train vs val vs test (REAL labels only)
+mae_train = safe_mae(y_true_full, y_pred_full, train_rows & y_mask_real)
+mae_val   = safe_mae(y_true_full, y_pred_full, val_rows   & y_mask_real)
+mae_test  = safe_mae(y_true_full, y_pred_full, test_rows  & y_mask_real)
+
+of_idx  = (mae_train - mae_val)/mae_val if np.isfinite(mae_train) and np.isfinite(mae_val) and mae_val>0 else np.nan
+of_idx2 = (mae_val   - mae_test)/mae_test if np.isfinite(mae_val) and np.isfinite(mae_test) and mae_test>0 else np.nan
+
+with open(os.path.join(SANITY_DIR, "overfit_report.txt"), "w", encoding="utf-8") as f:
+    f.write(f"TCN MAE (REAL labels only)\n")
+    f.write(f"  train: {mae_train:.3f}\n  val  : {mae_val:.3f}\n  test : {mae_test:.3f}\n")
+    f.write(f"Overfit index (train→val): {of_idx:.3f}\n")
+    f.write(f"Generalization drift (val→test): {of_idx2:.3f}\n")
+
+print(f"[SANITY] TCN MAE train/val/test = {mae_train:.2f}/{mae_val:.2f}/{mae_test:.2f}  (overfit idx={of_idx:.3f})")
+
+# --- 2) Gap-CV option for your GBM CV to avoid near-leakage
+# (Use this if you're re-running CV here; otherwise, add gap=WIN where you define TimeSeriesSplit)
+# Example patch:  TimeSeriesSplit(n_splits=5, gap=WIN)
+
+# --- 3) Baselines: persistence & rolling-mean (to ensure we beat trivial models)
+y_ffill = pd.Series(y_true_full).where(y_mask_real).ffill().to_numpy()
+# Persistence: y_hat[t] = last real label (at t-1)
+persist = np.r_[np.nan, y_ffill[:-1]]
+# Rolling mean of last K seconds (past only)
+K = int(5.0 / TICK_RATE)  # ~5 seconds
+roll = pd.Series(y_ffill).shift(1).rolling(K, min_periods=1).mean().to_numpy()
+
+mae_persist_test = safe_mae(y_true_full, persist, test_rows & y_mask_real)
+mae_roll_test    = safe_mae(y_true_full, roll,    test_rows & y_mask_real)
+
+with open(os.path.join(SANITY_DIR, "baseline_report.txt"), "w", encoding="utf-8") as f:
+    f.write(f"Baselines on TEST (REAL labels only)\n")
+    f.write(f"  persistence: {mae_persist_test:.3f}\n")
+    f.write(f"  rolling-{K} samples: {mae_roll_test:.3f}\n")
+    f.write(f"  TCN: {mae_test:.3f}\n")
+
+print(f"[SANITY] TEST baselines — persistence: {mae_persist_test:.2f}  rolling: {mae_roll_test:.2f}  | TCN: {mae_test:.2f}")
+
+# --- 4) Target-permutation smoke test (GBM quick check on a single fold)
+# If this does NOT degrade strongly vs real target → suspect leakage.
+try:
+    fold_lo = int(0.65 * len(df))
+    fold_hi = int(0.80 * len(df))
+    X_perm  = df.iloc[fold_lo:fold_hi][SELECTED].fillna(0)
+    y_real  = df.iloc[fold_lo:fold_hi][y_col].astype(float)
+    m = np.isfinite(y_real.to_numpy())
+    Xp, yr = X_perm.loc[m], y_real.loc[m]
+    # sanitize names
+    Xp_s = Xp.copy(); Xp_s.columns = Xp_s.columns.str.replace(r'[^0-9a-zA-Z_]', '_', regex=True)
+
+    mono = build_monotone_list(Xp.columns)
+    gbm  = make_lgb_fast(Xp_s.columns, device="cpu", params_override=BEST_LGB_PARAMS)
+    gbm.set_params(monotone_constraints=mono)
+    split = int(0.8*len(Xp_s))
+    gbm.fit(Xp_s.iloc[:split], yr.iloc[:split], eval_set=[(Xp_s.iloc[split:], yr.iloc[split:])],
+            eval_metric="l2", callbacks=[lgb.early_stopping(50, verbose=False)])
+    mae_true = mean_absolute_error(yr.iloc[split:], gbm.predict(Xp_s.iloc[split:]))
+
+    y_perm = yr.sample(frac=1.0, random_state=13).reset_index(drop=True)  # shuffled labels
+    gbm_p  = make_lgb_fast(Xp_s.columns, device="cpu", params_override=BEST_LGB_PARAMS)
+    gbm_p.set_params(monotone_constraints=mono)
+    gbm_p.fit(Xp_s.iloc[:split], y_perm.iloc[:split], eval_set=[(Xp_s.iloc[split:], y_perm.iloc[split:])],
+              eval_metric="l2", callbacks=[lgb.early_stopping(50, verbose=False)])
+    mae_perm = mean_absolute_error(yr.iloc[split:], gbm_p.predict(Xp_s.iloc[split:]))
+
+    with open(os.path.join(SANITY_DIR, "perm_report.txt"), "w", encoding="utf-8") as f:
+        f.write(f"GBM target-permutation smoke test (single fold)\n")
+        f.write(f"  real-target MAE : {mae_true:.3f}\n")
+        f.write(f"  PERMUTED  MAE   : {mae_perm:.3f}\n")
+        f.write("Expect permuted MAE >> real; otherwise suspect leakage.\n")
+    print(f"[SANITY] Permutation test MAE (real vs permuted): {mae_true:.2f} vs {mae_perm:.2f}")
+except Exception as e:
+    print("[SANITY] permutation test skipped:", e)
+
+# --- 5) Feature drift summary (train vs test) — mean/std/quantiles per feature
+summ = []
+for f in SELECTED:
+    a = df.loc[train_rows, f].to_numpy(np.float64)
+    b = df.loc[test_rows , f].to_numpy(np.float64)
+    if a.size < 10 or b.size < 10: 
+        continue
+    q = lambda x: np.nanquantile(x, [0.05, 0.50, 0.95])
+    summ.append({
+        "feature": f,
+        "train_mean": np.nanmean(a), "test_mean": np.nanmean(b),
+        "train_std":  np.nanstd(a),  "test_std":  np.nanstd(b),
+        "train_q05":  q(a)[0],       "test_q05":  q(b)[0],
+        "train_q50":  q(a)[1],       "test_q50":  q(b)[1],
+        "train_q95":  q(a)[2],       "test_q95":  q(b)[2],
+        "mean_shift_abs": abs(np.nanmean(a) - np.nanmean(b))
+    })
+pd.DataFrame(summ).sort_values("mean_shift_abs", ascending=False)\
+  .to_csv(os.path.join(SANITY_DIR, "feature_drift_train_vs_test.csv"), index=False)
+
+# --- 6) Residual autocorrelation (should decay fast; long tails hint leakage/underfit)
+valid_test = test_rows & y_mask_real & np.isfinite(y_true_full) & np.isfinite(y_pred_full)
+res = (y_pred_full - y_true_full)[valid_test]
+if res.size > 50:
+    L = min(200, res.size-1)  # up to ~20 s if TICK_RATE=0.1
+    ac = np.correlate(res - res.mean(), res - res.mean(), mode="full")
+    ac = ac[ac.size//2:ac.size//2+L+1]
+    ac = ac / ac[0]
+    t  = np.arange(L+1) * TICK_RATE
+    plt.figure(figsize=(7,4), dpi=200); plt.plot(t, ac); plt.ylim(-0.2, 1.0)
+    plt.xlabel("Lag [s]"); plt.ylabel("Residual ACF"); plt.title("Residual autocorrelation (TEST)")
+    plt.tight_layout(); plt.savefig(os.path.join(SANITY_DIR, "residual_acf_test.png")); plt.close()
+
+# --- 7) LightGBM monotonicity spot-check (vary one feature, hold others at median)
+def check_monotone_1d(model, X_frame, col, n=50, eps=1e-6):
+    X0 = X_frame.median(numeric_only=True).to_frame().T
+    xs = np.linspace(X_frame[col].quantile(0.02), X_frame[col].quantile(0.98), n)
+    Xs = pd.concat([X0]*n, ignore_index=True)
+    Xs[col] = xs
+    Z = Xs.copy(); Z.columns = Z.columns.str.replace(r'[^0-9a-zA-Z_]', '_', regex=True)
+    preds = model.predict(Z)
+    diffs = np.diff(preds)
+    inc = np.all(diffs >= -eps); dec = np.all(diffs <= eps)
+    return inc, dec
+
+# optional: run on the last fitted GBM models rf1/rf2 if available
+try:
+    cols = X1_safe.columns  # from your earlier section
+    # Check a couple monotone features you specified (+1): speed & pitch
+    for col in ["KO1_[km\\h]","Pitch_Angle_[Grad]"]:
+        if col in X1.columns:
+            inc, dec = check_monotone_1d(rf1, X1, col)
+            verdict = "INC" if inc else ("DEC" if dec else "VIOLATION")
+            print(f"[SANITY] Monotonicity {col}: {verdict}")
+except Exception:
+    pass
+
+# --- 8) Gate sanity — warn if too many features are effectively off
+try:
+    small = (gate_series < 1e-3).sum()
+    if small >= max(1, int(0.5*len(gate_series))):
+        print(f"[SANITY] ⚠ many gates are ~0: {small}/{len(gate_series)} — consider easing L1_GATES or re-check scaling.")
+except Exception:
+    pass
+
+# --- 9) Look-ahead smoke test — shift all predictors by +1 step; performance should drop
+df_lookahead = df.copy()
+for c in SELECTED:
+    df_lookahead[c] = df_lookahead[c].shift(-1)  # (uses future)
+pred_la = tcn_predict_series(df_lookahead, feature_cols=SELECTED, win=TRAIN_WIN)
+mae_la  = safe_mae(y_true_full, pred_la, test_rows & y_mask_real)
+with open(os.path.join(SANITY_DIR, "lookahead_smoke.txt"), "w") as f:
+    f.write(f"TEST MAE with +1 step *future* features injected: {mae_la:.3f}\n")
+    f.write("This number SHOULD be noticeably BETTER than baseline; "
+            "if your normal model is *similar*, you might be leaking future info.\n")
+print(f"[SANITY] look-ahead smoke MAE on TEST = {mae_la:.2f} (should be << normal if future info helps)")
+# ======================================================================
+
+
 # === [NEW] TCN LOFO importance on TEST ONLY (real labels only) ===
 rng = np.random.default_rng(42)
 
@@ -2061,10 +2263,14 @@ n_rows = len(df)
 test_start_row = TRAIN_WIN + i_va
 test_row_mask = np.zeros(n_rows, dtype=bool)
 if test_start_row < n_rows:
-    test_row_mask[test_start_row:] = True
+    context_start = max(0, test_start_row - TRAIN_WIN + 1)
+    test_row_mask[context_start:] = True
+
 
 # Evaluate only where: (a) in test rows, (b) real labels present, (c) baseline pred finite
 mask_eval = test_row_mask & y_mask_full & np.isfinite(y_true_full) & np.isfinite(base_pred_full)
+print(f"[LOFO] eval rows (real & finite) = {mask_eval.sum()}")
+
 
 from sklearn.metrics import mean_absolute_error
 base_mae = mean_absolute_error(y_true_full[mask_eval], base_pred_full[mask_eval])
@@ -2104,6 +2310,7 @@ plt.savefig("ml_charts/diagnostics/tcn_lofo_importance.png", dpi=300)
 plt.close()
 
 # ===  Rank alignment between GBM permutation and TCN-LOFO (optional) ===
+# ===  Rank alignment between GBM permutation and TCN-LOFO (robust) ===
 imp_path = "ml_charts/feature_importance/feature_importance_PM10_shifted.csv"
 if os.path.exists(imp_path):
     imp_gbm = pd.read_csv(imp_path)
@@ -2112,14 +2319,22 @@ if os.path.exists(imp_path):
 
     common = tcn_lofo.index.intersection(gbm_rank.index)
     if len(common) >= 3:
-        rho = tcn_lofo.loc[common].rank().corr(gbm_rank.loc[common].rank(), method="spearman")
-        print(f"[RANK] Spearman(GBM-permutation, TCN-LOFO TEST) = {rho:.2f} over {len(common)} features")
+        a = tcn_lofo.loc[common].rank()
+        b = gbm_rank.loc[common].rank()
+
+        if a.nunique() < 2 or b.nunique() < 2:
+            print(f"[RANK] Spearman undefined over {len(common)} features — "
+                  f"constant ranks (TCN uniq={a.nunique()}, GBM uniq={b.nunique()}).")
+        else:
+            rho = a.corr(b, method="spearman")
+            print(f"[RANK] Spearman(GBM-permutation, TCN-LOFO TEST) = {rho:.2f} over {len(common)} features")
+
         out = pd.DataFrame({
             "feature": common,
             "tcn_lofo_delta_mae": tcn_lofo.loc[common].values,
             "gbm_perm_avg": gbm_rank.loc[common].values,
-            "rank_tcn": tcn_lofo.loc[common].rank(ascending=False).values,
-            "rank_gbm": gbm_rank.loc[common].rank(ascending=False).values,
+            "rank_tcn": a.values,
+            "rank_gbm": b.values,
         }).sort_values("rank_tcn")
         out.to_csv("ml_charts/diagnostics/rank_alignment.csv", index=False)
 
@@ -2171,8 +2386,8 @@ for tgt in TARGETS_TO_PLOT:          # ["PM10_shifted"]
     pretty = PRETTY_PLOT[tgt]
     hat    = tgt.replace("_shifted", "_hat")
 
-    fig = plt.figure(figsize=(12, 8), dpi=200)
-    gs  = gridspec.GridSpec(3, 1, hspace=0.35)
+    fig = plt.figure(figsize=(12, 8), dpi=200, constrained_layout=True)
+    gs  = fig.add_gridspec(3, 1, hspace=0.35)
 
     # ① time series ----------------------------------------------------------
     ax1 = fig.add_subplot(gs[0])
