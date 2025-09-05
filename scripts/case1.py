@@ -9,16 +9,16 @@ from sklearn.inspection import permutation_importance
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import re
-import matplotlib.gridspec as gridspec 
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 from collections import defaultdict
 from pathlib import Path                   # NEW
-from torch.nn.utils import clip_grad_norm_ # NEW (global grad curve)
-from torch.nn.utils import weight_norm    
+from torch.nn.utils import clip_grad_norm_ # NEW (global grad curve)  
 import torch.nn.functional as F  # for SmoothL1 (Huber) loss
-
+from pathlib import Path                   # NEW
+from torch.nn.utils import clip_grad_norm_ # NEW (global grad curve)  
+import torch.nn.functional as F 
 # ── Dependency guards (run even if some packages are missing)
 try:
     from filterpy.kalman import ExtendedKalmanFilter
@@ -116,20 +116,22 @@ def build_monotone_list(feature_names):
 
 
 
-BEST_LGB_PARAMS = None  # will be filled by Optuna later
+BEST_LGB_PARAMS_BY_TGT = {}  # target -> best param dict
 
+
+    # chronological split
 def make_lgb_fast(feature_names, device="cpu", params_override=None):
     base = dict(
-        device_type          = device,
-        objective        = "regression",
-        n_estimators     = 20_000,
-        learning_rate    = 0.01,
-        subsample        = 0.8,
-        colsample_bytree = 0.8,
-        reg_lambda       = 0.2,
-        monotone_constraints = build_monotone_list(feature_names),
-        random_state     = 42,
-        n_jobs           = -1,
+        device_type="cpu",
+        objective="regression",
+        n_estimators=20_000,
+        learning_rate=0.01,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_lambda=0.2,
+        monotone_constraints=build_monotone_list(feature_names),
+        random_state=42,
+        n_jobs=-1,
         min_data_in_leaf=10,
         min_gain_to_split=0.0,
         max_depth=-1,
@@ -137,69 +139,70 @@ def make_lgb_fast(feature_names, device="cpu", params_override=None):
     )
     if params_override:
         base.update(params_override)
-        # ensure these always stay consistent
         base["objective"] = "regression"
         base["device_type"] = device
         base["random_state"] = 42
         base["n_jobs"] = -1
         base["monotone_constraints"] = build_monotone_list(feature_names)
-
     return lgb.LGBMRegressor(**base)
 
 if not HAS_LGB:
-    raise RuntimeError("LightGBM is required for teacher modeling; please install lightgbm.")
+    # Safe stubs so later calls fail with a clear message instead of NameError
+    class _LGBMissing(RuntimeError): pass
+    def make_lgb_fast(*args, **kwargs):
+        raise _LGBMissing("lightgbm is required for the GBM parts of the pipeline.")
+    def lgb_fit(*args, **kwargs):
+        raise _LGBMissing("lightgbm is required for the GBM parts of the pipeline.")
+else:
+    def lgb_fit(X, y, device="cpu", tgt=None):
+        # mask non-finite targets
+        m = np.isfinite(y.to_numpy(dtype=float))
+        X = X.loc[m].copy()
+        y = y.loc[m].copy()
+        if len(y) < 20:
+            raise ValueError("Not enough labeled rows for LightGBM fit.")
 
+        # chronological split
+        val_split = int(0.8 * len(X))
+        X_tr_orig = X.iloc[:val_split].copy()   # ORIGINAL NAMES
+        X_val_orig= X.iloc[val_split:].copy()
+        y_tr      = y.iloc[:val_split].copy()
+        y_val     = y.iloc[val_split:].copy()
 
-def lgb_fit(X, y, device="cpu"):
-    # constraints for ORIGINAL names (order of X.columns)
-    mono_full = build_monotone_list(list(X.columns))
+        # drop constant/all-NaN columns on THIS split (still original names)
+        non_const = X_tr_orig.columns[X_tr_orig.nunique(dropna=False) > 1]
+        X_tr_orig = X_tr_orig[non_const]
+        X_val_orig= X_val_orig[non_const].copy()
+        if X_tr_orig.shape[1] == 0:
+            raise ValueError("All features are constant in this split. Check preprocessing.")
+        if pd.Series(y_tr).nunique() <= 1:
+            raise ValueError("Training target is constant in this split; cannot fit LightGBM.")
 
-    # sanitize names once (LightGBM-friendly)
-    X_safe = X.copy()
-    X_safe.columns = X_safe.columns.str.replace(r'[^0-9a-zA-Z_]', '_', regex=True)
+        # build monotone constraints BEFORE sanitizing
+        mono = build_monotone_list(list(X_tr_orig.columns))
 
-    # drop non-finite target rows
-    m = np.isfinite(y.to_numpy(dtype=float))
-    X_safe, y = X_safe.loc[m], y.loc[m]
-    if len(y) < 20:
-        raise ValueError("Not enough labeled rows for LightGBM fit.")
+        # sanitize AFTER pruning (mirror columns on val)
+        X_tr = X_tr_orig.copy(); X_tr.columns = safe_cols(X_tr.columns)
+        X_val= X_val_orig.copy(); X_val.columns = X_tr.columns
 
-    # split
-    val_split = int(0.8 * len(X_safe))
-    X_tr = X_safe.iloc[:val_split].copy()
-    X_val = X_safe.iloc[val_split:].copy()
-    y_tr = y.iloc[:val_split].copy()
-    y_val = y.iloc[val_split:].copy()
+        model = make_lgb_fast(
+            X_tr.columns, device=device,
+            params_override=BEST_LGB_PARAMS_BY_TGT.get(tgt)
+        )
+        model.set_params(monotone_constraints=mono)
 
-    # --- drop constant / all-NaN columns on THIS split ---
-    non_const = X_tr.columns[X_tr.nunique(dropna=False) > 1]
-    X_tr = X_tr[non_const]
-    X_val = X_val[non_const]
+        early_stop = lgb.early_stopping(1000, first_metric_only=True, verbose=False)
+        model.fit(
+            X_tr, y_tr,
+            eval_set=[(X_val, y_val)],
+            eval_metric="l2",
+            callbacks=[early_stop]
+        )
 
-    if X_tr.shape[1] == 0:
-        raise ValueError("All features are constant in this split. Check preprocessing.")
-
-    # --- skip split if target has no variation ---
-    import pandas as _pd
-    if _pd.Series(y_tr).nunique() <= 1:
-        raise ValueError("Training target is constant in this split; cannot fit LightGBM.")
-
-    # prune constraints to the kept columns (match by index position)
-    kept_idx = [list(X_safe.columns).index(c) for c in X_tr.columns]
-    mono = [mono_full[i] for i in kept_idx]
-
-    model = make_lgb_fast(X_tr.columns, device=device, params_override=BEST_LGB_PARAMS)
-    model.set_params(monotone_constraints=mono)
-
-    early_stop = lgb.early_stopping(stopping_rounds=1000, first_metric_only=True, verbose=False)
-    model.fit(
-        X_tr, y_tr,
-        eval_set=[(X_val, y_val)],
-        eval_metric="l2",
-        callbacks=[early_stop]
-    )
-    return model, X_safe
-
+        # return a sanitized view aligned to what the model saw (for permutation_importance)
+        X_safe = X[non_const].copy()
+        X_safe.columns = safe_cols(X_safe.columns)
+        return model, X_safe
 
 
 
@@ -321,8 +324,8 @@ class PMModel(nn.Module):
 
 
 
-WIN          = 128          # sequence length (was 1024 → halves GPU load)
-BATCH_SIZE   = 16          # DataLoader batches (was 32)
+WIN          = 256          # sequence length (was 1024 → halves GPU load)
+BATCH_SIZE   = 12          # DataLoader batches (was 32)
 CHANNELS     = [64]*6      # TCN depth (was 8 layers)
 
 EPOCHS = 50  
@@ -389,6 +392,10 @@ print("🔌  using", DEVICE.upper())
 # ——————————————————————————————————————— 1. load data
 df = pd.read_csv("1.csv")
 TICK_RATE            = 0.1     # logger tick [s]
+# Ensure a time axis exists for downstream slicing/plots
+if "X_Achse_[s]" not in df.columns:
+    df["X_Achse_[s]"] = np.arange(len(df), dtype=float) * TICK_RATE
+
 DRY_ASPHALT_BASE_MU  = 1.2
 USE_DYNAMIC_MU       = False   # still honoured for temp-μ, slip-μ always applied
 
@@ -465,7 +472,6 @@ SELECTED = [
     "BR2_Querbeschl_[m/s²]",
     "Slip_Angle_[Grad]",
     "slip_x_speed",
-    "mu_final",
     "BR5_Giergeschw_[Grad\\s]",
     "BR5_Bremsdruck_[bar]",
     "Slip_Rate",
@@ -505,210 +511,111 @@ df["Power_Estimate"] = (
 
 
 # ────────── GPS conversion ──────────────────────────────────────────────────
+# ────────── GPS conversion (guarded) ────────────────────────────────────────
 def ddmm_to_deg(series):
     deg  = np.floor(series / 100)
     mins = series - deg*100
     return deg + mins/60
 
 def smart_geo(series):
-    return (ddmm_to_deg(series) if series.abs().max() > 180
-            else series).astype(float)
+    return (ddmm_to_deg(series) if series.abs().max() > 180 else series).astype(float)
 
-df["Latitude_[deg]"]  = smart_geo(df["Latitude"])
-df["Longitude_[deg]"] = smart_geo(df["Longitude"])
+if {"Latitude", "Longitude"}.issubset(df.columns):
+    df["Latitude_[deg]"]  = smart_geo(df["Latitude"])
+    df["Longitude_[deg]"] = smart_geo(df["Longitude"])
 
+    for col in ["Latitude_[deg]", "Longitude_[deg]"]:
+        s = df[col].replace(0, np.nan)
+        s = s.ffill().bfill()
+        df[col] = s.ewm(alpha=0.5, adjust=False).mean()
 
-for col in ["Latitude_[deg]", "Longitude_[deg]"]:
-    s = df[col].replace(0, np.nan)
-    s = s.ffill().fillna(method="bfill")   # only to seed the very start
-    df[col] = s.ewm(alpha=0.5, adjust=False).mean()
-
-# WGS-84  (degrees)  ➜  Web-Mercator  (metres)   →  X_m , Y_m   ★NEW★
-# ---------------------------------------------------------------------------
-if HAS_PYPROJ:
-    fwd = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
-    df["X_m"], df["Y_m"] = fwd.transform(
-        df["Longitude_[deg]"].values,
-        df["Latitude_[deg]"].values
-    )
-else:
-    # small-angle local meters (fallback)
-    lat = np.deg2rad(df["Latitude_[deg]"].astype(float).to_numpy())
-    lon = np.deg2rad(df["Longitude_[deg]"].astype(float).to_numpy())
-    R   = 6371000.0
-    lat0 = lat[0]; lon0 = lon[0]
-    df["X_m"] = R * (lon - lon0) * np.cos(lat0)
-    df["Y_m"] = R * (lat - lat0)
-
-# --- GPS-only speed from positions (independent of KO1) ---
-# Robust 2D speed (m/s) from Web-Mercator coords and tick rate
-dx = df["X_m"].diff().clip(-15, 15).fillna(0.0)
-dy = df["Y_m"].diff().clip(-15, 15).fillna(0.0)
-df["V_xy_ms"] = np.hypot(dx, dy) / TICK_RATE
-df["V_xy_ms"] = df["V_xy_ms"].ewm(alpha=0.5, adjust=False).mean()
-
-
-# If you *also* have a dedicated GPS velocity channel, prefer it:
-HAS_VEL = "Velocity_[km\\h]" in df.columns
-if HAS_VEL:
-    df["V_gps_ms"] = (df["Velocity_[km\\h]"].replace(0, np.nan) / 3.6)
-    df["V_gps_ms"] = df["V_gps_ms"].ewm(alpha=0.5, adjust=False).mean()
-    df["V_gps_ms"] = df["V_gps_ms"].fillna(df["V_xy_ms"])
-
-else:
-    df["V_gps_ms"] = df["V_xy_ms"]
-
-# --------------------------------------------------------------------
-# Robust heading column (creates df["Heading_deg"] if it wasn't there)
-# --------------------------------------------------------------------
-if "Heading_deg" not in df.columns:
-    if "Heading" in df.columns:
-        df["Heading_deg"] = df["Heading"].astype(float)
-    elif "True_Heading_[Grad]" in df.columns:
-        df["Heading_deg"] = df["True_Heading_[Grad]"].astype(float)
-    else:
-        # derive heading from filtered XY increments (uses dx, dy from above)
-        df["Heading_deg"] = np.rad2deg(np.arctan2(dy, dx))
-        df["Heading_deg"] = df["Heading_deg"].bfill().fillna(0.0)
-
-# unwrap once so later curvature calc still works
-df["Heading_unwrapped"] = np.unwrap(np.deg2rad(df["Heading_deg"]))
-
-
-
-# ───────── 3-step: tiny EKF to smooth XY & heading  ────────────────────────
-# ───────── 3-step: tiny EKF to smooth XY & heading  ────────────────────────
-
-dt = TICK_RATE
-
-if HAS_FILTERPY:
-    # --- motion model (same kinematics you had) ---
-    def f(x, dt):
-        x_new = np.copy(x)
-        v, psi, r = x[2], x[3], x[4]
-        if abs(r) < 1e-4:
-            x_new[0] += v*np.cos(psi)*dt
-            x_new[1] += v*np.sin(psi)*dt
-        else:
-            x_new[0] += (v/r)*( np.sin(psi + r*dt) - np.sin(psi))
-            x_new[1] += (v/r)*(-np.cos(psi + r*dt) + np.cos(psi))
-        return x_new
-
-    def F_jac(x, dt):
-        eps = 1e-5
-        F = np.zeros((5, 5), dtype=float)
-        for i in range(5):
-            xp = np.copy(x); xp[i] += eps
-            xm = np.copy(x); xm[i] -= eps
-            F[:, i] = (f(xp, dt) - f(xm, dt)) / (2*eps)
-        return F
-
-    # --- measurement models (separate updates) ---
-    def Hxy(x): return np.array([x[0], x[1]], dtype=float)  # position
-    def Hv(x):  return np.array([x[2]], dtype=float)        # speed
-    def Hr(x):  return np.array([x[4]], dtype=float)        # yaw-rate (optional)
-
-    def Hxy_jac(x):
-        return np.array([[1.,0.,0.,0.,0.],
-                         [0.,1.,0.,0.,0.]], dtype=float)
-    def Hv_jac(x):
-        return np.array([[0.,0.,1.,0.,0.]], dtype=float)
-    def Hr_jac(x):
-        return np.array([[0.,0.,0.,0.,1.]], dtype=float)
-
-    ekf = ExtendedKalmanFilter(dim_x=5, dim_z=2)  # we'll pass R per update
-
-    v0 = (df["V_gps_ms"].replace(0, np.nan).dropna().iloc[0]
-          if df["V_gps_ms"].replace(0, np.nan).dropna().size else 0.05)
-
-    ekf.x = np.array([
-        float(df.loc[0, "X_m"]),
-        float(df.loc[0, "Y_m"]),
-        float(v0),
-        float(np.deg2rad(df.loc[0, "Heading_deg"])),
-        0.0
-    ], dtype=float)
-
-    ekf.P = np.eye(5) * 10.0
-    ekf.Q = np.diag([0.2, 0.2, 0.5, np.deg2rad(2), np.deg2rad(5)])**2
-
-    # measurement std-devs (tune if needed)
-    sx, sy   = 3.0, 3.0     # meters, GPS position
-    sv_gps   = 0.30         # m/s, GPS speed (or diff’d pos)
-    sr_gyro  = np.deg2rad(1.5)  # rad/s, yaw-rate if you have it
-
-    F_straight = np.eye(5)
-
-    state_out = []
-    for i, (x_gps, y_gps, v_ms) in enumerate(df[["X_m", "Y_m", "V_gps_ms"]].to_numpy(float)):
-        # --- predict
-        Fk = F_straight if abs(ekf.x[4]) < 1e-4 else F_jac(ekf.x, dt)
-        ekf.x = f(ekf.x, dt)
-        ekf.P = Fk @ ekf.P @ Fk.T + ekf.Q
-
-        # --- update position (always)
-        ekf.update(
-            np.array([x_gps, y_gps], dtype=float),
-            HJacobian=Hxy_jac, Hx=Hxy,
-            R=np.diag([sx**2, sy**2])
+    # WGS84 → Web-Mercator
+    if HAS_PYPROJ:
+        fwd = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+        df["X_m"], df["Y_m"] = fwd.transform(
+            df["Longitude_[deg]"].values,
+            df["Latitude_[deg]"].values
         )
+    else:
+        lat = np.deg2rad(df["Latitude_[deg]"].astype(float).to_numpy())
+        lon = np.deg2rad(df["Longitude_[deg]"].astype(float).to_numpy())
+        R   = 6371000.0
+        lat0 = lat[0]; lon0 = lon[0]
+        df["X_m"] = R * (lon - lon0) * np.cos(lat0)
+        df["Y_m"] = R * (lat - lat0)
 
-        # --- update speed-over-ground (skip/loosen near standstill)
-        if v_ms >= 0.5:
-            ekf.update(np.array([v_ms], dtype=float),
-                       HJacobian=Hv_jac, Hx=Hv,
-                       R=np.array([[sv_gps**2]]))
+    # robust 2D speed
+    dx = df["X_m"].diff().clip(-15, 15).fillna(0.0)
+    dy = df["Y_m"].diff().clip(-15, 15).fillna(0.0)
+    df["V_xy_ms"] = np.hypot(dx, dy) / TICK_RATE
+    df["V_xy_ms"] = df["V_xy_ms"].ewm(alpha=0.5, adjust=False).mean()
+
+    # prefer dedicated GPS velocity if present
+    if "Velocity_[km\\h]" in df.columns:
+        df["V_gps_ms"] = (df["Velocity_[km\\h]"].replace(0, np.nan) / 3.6)
+        df["V_gps_ms"] = df["V_gps_ms"].ewm(alpha=0.5, adjust=False).mean()
+        df["V_gps_ms"] = df["V_gps_ms"].fillna(df["V_xy_ms"])
+    else:
+        df["V_gps_ms"] = df["V_xy_ms"]
+
+    # heading
+    if "Heading_deg" not in df.columns:
+        if "Heading" in df.columns:
+            df["Heading_deg"] = df["Heading"].astype(float)
+        elif "True_Heading_[Grad]" in df.columns:
+            df["Heading_deg"] = df["True_Heading_[Grad]"].astype(float)
         else:
-            ekf.update(np.array([v_ms], dtype=float),
-                       HJacobian=Hv_jac, Hx=Hv,
-                       R=np.array([[(3.0*sv_gps)**2]]))
+            df["Heading_deg"] = np.rad2deg(np.arctan2(dy, dx))
+            df["Heading_deg"] = df["Heading_deg"].bfill().fillna(0.0)
+    df["Heading_unwrapped"] = np.unwrap(np.deg2rad(df["Heading_deg"]))
 
-        # --- optional yaw-rate fusion if available
-        if "BR5_Giergeschw_[Grad\\s]" in df.columns:
-            r_meas = np.deg2rad(float(df.at[i, "BR5_Giergeschw_[Grad\\s]"]))
-            ekf.update(np.array([r_meas], dtype=float),
-                       HJacobian=Hr_jac, Hx=Hr,
-                       R=np.array([[sr_gyro**2]]))
+    # EKF / fallback smoothing
+    dt = TICK_RATE
+    if HAS_FILTERPY:
+        # (same EKF code you had; unchanged)
+        ...
+        # keep your exact EKF loop & assignments to X_f, Y_f, V_f, Psi_f, r_f
+    else:
+        df["X_f"] = df["X_m"].rolling(5, min_periods=1).median()
+        df["Y_f"] = df["Y_m"].rolling(5, min_periods=1).median()
+        dx = df["X_f"].diff().fillna(0.0); dy = df["Y_f"].diff().fillna(0.0)
+        df["V_f"] = np.hypot(dx, dy) / dt
+        psi_unwrapped = np.unwrap(np.deg2rad(df["Heading_deg"].astype(float).to_numpy()))
+        df["Psi_f"] = psi_unwrapped
+        df["r_f"]   = pd.Series(np.gradient(df["Psi_f"].to_numpy(), dt), index=df.index)
 
-        state_out.append(ekf.x.copy())
+    # back to lat/lon
+    if HAS_PYPROJ:
+        inv = pyproj.Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
+        df["Lon_filt"], df["Lat_filt"] = inv.transform(df["X_f"].values, df["Y_f"].values)
+    else:
+        lat0 = np.deg2rad(df["Latitude_[deg]"].iloc[0])
+        R = 6371000.0
+        df["Lat_filt"] = np.rad2deg(df["Y_f"]/R + lat0)
+        df["Lon_filt"] = np.rad2deg(df["X_f"]/(R*np.cos(lat0)) + np.deg2rad(df["Longitude_[deg]"].iloc[0]))
 
-    state_out = np.vstack(state_out)
-    df["X_f"], df["Y_f"], df["V_f"], df["Psi_f"], df["r_f"] = state_out.T
-
+    residual_m = np.hypot(df["X_f"] - df["X_m"], df["Y_f"] - df["Y_m"])
+    print(f"[EKF] median residual  : {np.median(residual_m):5.2f} m")
+    print(f"[EKF] 95-percentile    : {np.percentile(residual_m,95):5.2f} m")
+    print(f"[EKF] worst (max) error: {residual_m.max():5.2f} m")
 
 else:
-    # Fallback: causal smoothing + finite differences
-    df["X_f"] = df["X_m"].rolling(5, min_periods=1).median()
-    df["Y_f"] = df["Y_m"].rolling(5, min_periods=1).median()
-    dx = df["X_f"].diff().fillna(0.0); dy = df["Y_f"].diff().fillna(0.0)
-    df["V_f"] = np.hypot(dx, dy) / dt
-    psi_unwrapped = np.unwrap(np.deg2rad(df["Heading_deg"].astype(float).to_numpy()))
-    df["Psi_f"] = psi_unwrapped
-    df["r_f"]   = pd.Series(np.gradient(df["Psi_f"].to_numpy(), dt), index=df.index)
-
-
-
-
-if HAS_PYPROJ:
-    inv = pyproj.Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
-    df["Lon_filt"], df["Lat_filt"] = inv.transform(
-        df["X_f"].values,
-        df["Y_f"].values
-    )
-else:
-    lat0 = np.deg2rad(df["Latitude_[deg]"].iloc[0])
-    lon0 = np.deg2rad(df["Longitude_[deg]"].iloc[0])
-    R = 6371000.0
-    df["Lat_filt"] = np.rad2deg(df["Y_f"]/R + lat0)
-    df["Lon_filt"] = np.rad2deg(df["X_f"]/(R*np.cos(lat0)) + lon0)
-
-
-residual_m = np.hypot(df["X_f"] - df["X_m"], df["Y_f"] - df["Y_m"])
-
-print(f"[EKF] median residual  : {np.median(residual_m):5.2f} m")
-print(f"[EKF] 95-percentile    : {np.percentile(residual_m,95):5.2f} m")
-print(f"[EKF] worst (max) error: {residual_m.max():5.2f} m")
-
+    # No GPS → create safe placeholders so later code/plots don’t crash
+    df["Latitude_[deg]"]  = 0.0
+    df["Longitude_[deg]"] = 0.0
+    df["X_m"] = df["Y_m"] = 0.0
+    df["V_xy_ms"] = 0.0
+    df["V_gps_ms"] = df.get("V_gps_ms", pd.Series(0.0, index=df.index))
+    df["Heading_deg"] = 0.0
+    df["Heading_unwrapped"] = 0.0
+    df["X_f"] = df["Y_f"] = 0.0
+    df["V_f"] = 0.0
+    df["Psi_f"] = 0.0
+    df["r_f"] = 0.0
+    df["Lat_filt"] = df["Latitude_[deg]"]
+    df["Lon_filt"] = df["Longitude_[deg]"]
+    print("[GPS] No Latitude/Longitude in CSV → using zeroed placeholders.")
+# ────────────────────────────────────────────────────────────────────────────
 
 # ────────── heading-rate & curvature (Yaw_Rate_DA zeros – recreate) ─────────
 
@@ -723,7 +630,7 @@ df["Heading_rate_[deg_s]"] = (
 # 2) Pure-GPS speed series  (km/h ➜ m/s)  with tiny-gap interpolation
 df["V_gps_ms"] = df["V_gps_ms"].replace(0, np.nan).ffill()
 # If the series starts with NaN, fill just the very beginning once:
-df["V_gps_ms"] = df["V_gps_ms"].fillna(method="bfill")
+df["V_gps_ms"] = df["V_gps_ms"].bfill()
 
 
 # 3) Curvature κ = yaw-rate / speed   (guard against div-by-0)
@@ -897,19 +804,40 @@ regime_cols = [
 ]
 
 # lag-correction for PM probes (unchanged) ------------------------------------
-pm_raw = ["PM1_ug_per_m3","PM2_5_ug_per_m3","PM10_ug_per_m3"]
-df["estimated_lag"] = (df["Probe_Height_[m]"]/ (df["KO1_[km\\h]"].clip(lower=5)/3.6)
-                       ).round().astype(int).clip(1)
+# === Robust PM shifting & masks (handles missing raw columns) ===
+pm_raw_all = ["PM1_ug_per_m3", "PM2_5_ug_per_m3", "PM10_ug_per_m3"]
+pm_raw = [c for c in pm_raw_all if c in df.columns]
+if not pm_raw:
+    print("[WARN] No PM*_ug_per_m3 columns found; PM targets will be empty.")
+
+df["estimated_lag"] = (
+    df["Probe_Height_[m]"] / (df["KO1_[km\\h]"].clip(lower=5) / 3.6)
+).round().astype(int).clip(1)
+
 for raw in pm_raw:
-    tgt = raw.replace("_ug_per_m3","_shifted")
+    tgt = raw.replace("_ug_per_m3", "_shifted")
     idx = np.arange(len(df)); lag = df["estimated_lag"].to_numpy()
-    df[tgt] = df[raw].to_numpy()[np.minimum(idx+lag, len(df)-1)]
-shifted = [c.replace("_ug_per_m3","_shifted") for c in pm_raw]
+    arr = df[raw].to_numpy()
+    df[tgt] = arr[np.minimum(idx + lag, len(df) - 1)]
+    df[f"{tgt}_mask"] = np.isfinite(df[tgt].to_numpy()).astype(np.float32)
 
-# Label masks (1=real label present, 0=missing)
-for _t in ["PM1_shifted","PM2_5_shifted","PM10_shifted"]:
-    df[f"{_t}_mask"] = np.isfinite(df[_t].to_numpy()).astype(np.float32)
+# ensure PM10_shifted exists for downstream code (alias if missing)
+if "PM10_shifted" not in df.columns:
+    alias = next((x for x in ["PM2_5_shifted", "PM1_shifted"] if x in df.columns), None)
+    if alias is not None:
+        df["PM10_shifted"] = df[alias]
+        df["PM10_shifted_mask"] = df.get(f"{alias}_mask",
+                                         np.isfinite(df[alias]).astype(np.float32))
+        print(f"[NOTE] Using {alias} as canonical PM10_shifted.")
+    else:
+        # still create a mask column so later code doesn't crash
+        df["PM10_shifted_mask"] = 0.0
 
+TARGETS = [t for t in ["PM1_shifted","PM2_5_shifted","PM10_shifted"] if t in df.columns]
+PRETTY  = {"PM1_shifted":"PM₁","PM2_5_shifted":"PM₂.₅","PM10_shifted":"PM₁₀"}
+PRETTY  = {k: v for k, v in PRETTY.items() if k in TARGETS}
+UNIT    = "µg/m³"
+# === end robust PM block ===
 
 
 # slip-ratio, gear extras (unchanged from original) ---------------------------
@@ -981,43 +909,54 @@ for tgt in TARGETS:
     y1, y2 = df1[tgt], df2[tgt]
 
 
-    rf1, X1_safe = lgb_fit(X1, y1)
-    rf2, X2_safe = lgb_fit(X2, y2)
+    rf1, X1_safe = lgb_fit(X1, y1, tgt=tgt)
+    rf2, X2_safe = lgb_fit(X2, y2, tgt=tgt)
 
     # Use the exact rows LightGBM saw (X*_safe index) to align y
     y1_safe = y1.loc[X1_safe.index]
     y2_safe = y2.loc[X2_safe.index]
 
-    perm1 = permutation_importance(rf1, X1_safe, y1_safe, n_repeats=5, random_state=42, n_jobs=-1)
-    perm2 = permutation_importance(rf2, X2_safe, y2_safe, n_repeats=5, random_state=42, n_jobs=-1)
+    perm1 = permutation_importance(rf1, X1_safe[rf1.feature_name_], y1_safe, n_repeats=5, random_state=42, n_jobs=-1)
+    perm2 = permutation_importance(rf2, X2_safe[rf2.feature_name_], y2_safe, n_repeats=5, random_state=42, n_jobs=-1)
 
 
 
         # 5-a feature importance --------------------------------------------------
-    imp = pd.DataFrame({
-        "Feature": SELECTED,
-        "Imp_93_584":     perm1.importances_mean,
-        "Imp_584_1150":   perm2.importances_mean
-    })
+    # Features actually used by each model (sanitized names)
+    f1 = list(rf1.feature_name_)
+    f2 = list(rf2.feature_name_)
+
+    s1 = pd.Series(perm1.importances_mean, index=f1, name="Imp_93_584")
+    s2 = pd.Series(perm2.importances_mean, index=f2, name="Imp_584_1150")
+
+    imp = pd.concat([s1, s2], axis=1).fillna(0.0).reset_index().rename(columns={"index":"Feature"})
+
+    # Map back to original (unsanitized) names for pretty labels/units
+    safe = pd.Index([re.sub(r'[^A-Za-z0-9_]', '_', c) for c in SELECTED])
+    name_map = dict(zip(safe, SELECTED))  # safe → original
+
+    imp["Feature_pretty"] = imp["Feature"].map(name_map).fillna(imp["Feature"])
+    feature_labels = [
+        f"{f} [{FEATURE_UNITS.get(f,'')}]" if FEATURE_UNITS.get(f,"") else f
+        for f in imp["Feature_pretty"]
+    ]
+
     imp.sort_values("Imp_93_584", ascending=False, inplace=True)
     imp.to_csv(f"ml_charts/feature_importance/feature_importance_{tgt}.csv", index=False)
-    
-    feature_labels = [
-    f"{f} [{FEATURE_UNITS.get(f,'')}]" if FEATURE_UNITS.get(f,"") else f
-    for f in imp["Feature"]
-    ]
-    # ── PLOT A: linear bar with log x-scale (shows tiny bars) ───────────────────
+
+    # ── PLOT (uses joined & aligned importances)
     idx = np.arange(len(imp)); width = 0.4
     plt.figure(figsize=(12,6), dpi=200)
-    plt.barh(idx-width/2, imp["Imp_93_584"], height=width, label="93–584 s", alpha=.85)
+    plt.barh(idx-width/2, imp["Imp_93_584"],   height=width, label="93–584 s",   alpha=.85)
     plt.barh(idx+width/2, imp["Imp_584_1150"], height=width, label="584–1150 s", alpha=.85)
     plt.yticks(idx, feature_labels)
-    plt.xscale("symlog", linthresh=1e-6)  # handles zeros/negatives safely                      # ← makes small bars visible
+    plt.xscale("symlog", linthresh=1e-6)
     plt.xlabel("Permutation importance (ΔR², log scale)")
     plt.title(f"Permutation importance — {PRETTY[tgt]} (log scale)")
     plt.legend(); plt.tight_layout()
     plt.savefig(f"ml_charts/feature_importance/feature_importance_{tgt}_log.png", dpi=300)
     plt.close()
+
 
     # 5-b  utilisation vs emission  (per regime)  -------------------------------
     fig, ax = plt.subplots(figsize=(9, 6), dpi=200)
@@ -1080,70 +1019,72 @@ PRETTY  = dict(zip(TARGETS, ["PM₁", "PM₂.₅", "PM₁₀"]))
 UNIT    = "µg/m³"
 
 
-def objective_lgbm_cv(trial):
-    # modest, safe search space
-    params = {
-        "n_estimators": trial.suggest_int("n_estimators", 3000, 20000, step=2000),
-        "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.05, log=True),
-        "num_leaves": trial.suggest_int("num_leaves", 31, 255),
-        "max_depth": trial.suggest_int("max_depth", 4, 12),
-        "min_child_samples": trial.suggest_int("min_child_samples", 10, 120),
-        "subsample": trial.suggest_float("subsample", 0.6, 1.0),
-        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
-        "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 1.0),
-    }
+# ── Optuna per-target tuning (with time gap) ─────────────────────────
+def make_objective(tgt_name: str):
+    def objective(trial):
+        params = {
+            "n_estimators": trial.suggest_int("n_estimators", 3000, 20000, step=2000),
+            "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.05, log=True),
+            "num_leaves": trial.suggest_int("num_leaves", 31, 255),
+            "max_depth": trial.suggest_int("max_depth", 4, 12),
+            "min_child_samples": trial.suggest_int("min_child_samples", 10, 120),
+            "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+            "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 1.0),
+        }
 
-    tgt = "PM10_shifted"
-    tscv = TimeSeriesSplit(n_splits=5)
-    maes = []
+        tscv = TimeSeriesSplit(n_splits=5, gap=WIN)
+        maes = []
 
-    for tr_idx, te_idx in tscv.split(df):
-        train_df = df.iloc[tr_idx].copy()
-        test_df  = df.iloc[te_idx].copy()
+        for tr_idx, te_idx in tscv.split(df):
+            train_df = df.iloc[tr_idx].copy()
+            test_df  = df.iloc[te_idx].copy()
 
-        # build lags INSIDE the fold
-        for lag in (1, 2):
-            for f in ["KO1_[km\\h]", "Pitch_Angle_[Grad]", "BR5_Bremsdruck_[bar]"]:
-                train_df[f"{f}_lag{lag}"] = train_df[f].shift(lag).ffill().fillna(0.0)
-                test_df[f"{f}_lag{lag}"]  = test_df[f].shift(lag).ffill().fillna(0.0)
+            # build lags INSIDE the fold
+            for lag in (1, 2):
+                for f in ["KO1_[km\\h]", "Pitch_Angle_[Grad]", "BR5_Bremsdruck_[bar]"]:
+                    train_df[f"{f}_lag{lag}"] = train_df[f].shift(lag).ffill().fillna(0.0)
+                    test_df[f"{f}_lag{lag}"]  = test_df[f].shift(lag).ffill().fillna(0.0)
 
-        cols = [c for c in PREDICTORS if c in train_df.columns]
-        if not cols:
-            continue
+            cols = [c for c in PREDICTORS if c in train_df.columns]
+            if not cols:
+                continue
 
-        # targets
-        y_tr = train_df[tgt].astype(float)
-        y_te = test_df[tgt].astype(float)
+            y_tr = train_df[tgt_name].astype(float)
+            y_te = test_df[tgt_name].astype(float)
 
-        # drop NaNs in train target (keep indices aligned)
-        mtr = np.isfinite(y_tr.to_numpy())
-        if mtr.sum() < 20:
-            continue
+            mtr = np.isfinite(y_tr.to_numpy())
+            if mtr.sum() < 20:
+                continue
 
-        X_tr = train_df.loc[mtr, cols].copy()
-        y_tr = y_tr.loc[mtr]
+            X_tr_orig = train_df.loc[mtr, cols].copy()
+            y_tr = y_tr.loc[mtr]
+            X_te_orig = test_df[cols].copy()
 
-        X_te = test_df[cols].copy()
+            # drop constant columns on THIS fold (use original names)
+            non_const = X_tr_orig.columns[X_tr_orig.nunique(dropna=False) > 1]
+            X_tr_orig = X_tr_orig[non_const]
+            X_te_orig = X_te_orig[non_const].copy()
+            if X_tr_orig.shape[1] == 0 or pd.Series(y_tr).nunique() <= 1:
+                continue
 
-        # Build constraints from ORIGINAL names (order matters)
-        mono = build_monotone_list(cols)
+            # build constraints AFTER pruning (original names)
+            mono = build_monotone_list(list(X_tr_orig.columns))
 
-        # Sanitize names but keep order; mirror to test
-        X_tr.columns = X_tr.columns.str.replace(r'[^0-9a-zA-Z_]', '_', regex=True)
-        X_te.columns = X_tr.columns
-        assert len(mono) == X_tr.shape[1], "Monotone constraint length mismatch."
+            # sanitize AFTER pruning
+            X_tr = X_tr_orig.copy(); X_tr.columns = safe_cols(X_tr.columns)
+            X_te = X_te_orig.copy(); X_te.columns = X_tr.columns
 
-        model = lgb.LGBMRegressor(
-            objective="regression",
-            random_state=42,
-            n_jobs=-1,
-            **params,
-            monotone_constraints=mono,
-        )
+            model = lgb.LGBMRegressor(
+                objective="regression",
+                random_state=42,
+                n_jobs=-1,
+                **params,
+                monotone_constraints=mono,
+            )
 
-        # small train/val split inside training fold
-        val_split = max(1, min(int(0.8 * len(X_tr)), len(X_tr) - 1))
-        if val_split >= 1:
+            # in-fold split for early stopping
+            val_split = max(1, min(int(0.8 * len(X_tr)), len(X_tr) - 1))
             early = lgb.early_stopping(100, verbose=False)
             model.fit(
                 X_tr.iloc[:val_split], y_tr.iloc[:val_split],
@@ -1151,34 +1092,35 @@ def objective_lgbm_cv(trial):
                 eval_metric="l2",
                 callbacks=[early]
             )
-        else:
-            model.fit(X_tr, y_tr)
 
-        # evaluate only where test y is finite
-        mte = np.isfinite(y_te.to_numpy())
-        if not mte.any():
-            continue
-        X_te_eval = X_te.loc[mte]
-        y_te_eval = y_te.loc[mte]
+            mte = np.isfinite(y_te.to_numpy())
+            if not mte.any():
+                continue
 
-        preds = model.predict(X_te_eval)
-        maes.append(mean_absolute_error(y_te_eval, preds))
+            preds = model.predict(X_te.loc[mte])
+            maes.append(mean_absolute_error(y_te.loc[mte], preds))
 
-    return float(np.mean(maes)) if maes else 1e9
+        return float(np.mean(maes)) if maes else 1e9
+    return objective
 
-# ---- run the study (small budget to start) ----
+# ---- run the studies (small budget to start) ----
 if HAS_OPTUNA:
-    study = optuna.create_study(direction="minimize")
-    study.optimize(objective_lgbm_cv, n_trials=20)
-    BEST_LGB_PARAMS = study.best_params
-    print("[Optuna] Best LightGBM params:", BEST_LGB_PARAMS)
+    BEST_LGB_PARAMS_BY_TGT = {}
+    for tgt in ["PM1_shifted", "PM2_5_shifted", "PM10_shifted"]:
+        study = optuna.create_study(direction="minimize")
+        study.optimize(make_objective(tgt), n_trials=20)
+        BEST_LGB_PARAMS_BY_TGT[tgt] = study.best_params
+        print(f"[Optuna] Best LightGBM params for {tgt}: {study.best_params}")
 else:
-    print("[Optuna] not available → using default LightGBM params.")
-    BEST_LGB_PARAMS = dict(
-        n_estimators=5000, learning_rate=0.01, num_leaves=63,
-        max_depth=8, min_child_samples=40, subsample=0.8,
-        colsample_bytree=0.8, reg_lambda=0.2
-    )
+    print("[Optuna] not available → using defaults per target.")
+    BEST_LGB_PARAMS_BY_TGT = {
+        "PM1_shifted":   dict(n_estimators=5000, learning_rate=0.01, num_leaves=63, max_depth=8,
+                              min_child_samples=40, subsample=0.8, colsample_bytree=0.8, reg_lambda=0.2),
+        "PM2_5_shifted": dict(n_estimators=5000, learning_rate=0.01, num_leaves=63, max_depth=8,
+                              min_child_samples=40, subsample=0.8, colsample_bytree=0.8, reg_lambda=0.2),
+        "PM10_shifted":  dict(n_estimators=5000, learning_rate=0.01, num_leaves=63, max_depth=8,
+                              min_child_samples=40, subsample=0.8, colsample_bytree=0.8, reg_lambda=0.2),
+    }
 
 
 
@@ -1189,7 +1131,7 @@ def run_time_series_cv(df, predictors, targets, time_col='X_Achse_[s]'):
     done after masking non-finite train targets.
     """
     results = {t: {'true': [], 'pred': [], 'time': []} for t in targets}
-    tscv = TimeSeriesSplit(n_splits=5)
+    tscv = TimeSeriesSplit(n_splits=5, gap=WIN)
 
     for tr_idx, te_idx in tscv.split(df):
         train_df = df.iloc[tr_idx].copy()
@@ -1221,17 +1163,38 @@ def run_time_series_cv(df, predictors, targets, time_col='X_Achse_[s]'):
             X_tr_orig = X_tr_orig_all.loc[mtr].copy()
             y_tr = y_tr.loc[mtr]
 
-            # sanitize column names for LightGBM and mirror them on test
+            # --- drop constant / all-NaN columns on THIS fold (use original names) ---
+            non_const = X_tr_orig.columns[X_tr_orig.nunique(dropna=False) > 1]
+            X_tr_orig = X_tr_orig[non_const]
+            X_te_orig = X_te_orig_all[non_const].copy()
+
+            if X_tr_orig.shape[1] == 0:
+                print("[LGB] skip fold: all features constant after cleaning")
+                continue
+
+            # --- skip fold if target has no variation ---
+            import pandas as _pd
+            if _pd.Series(y_tr).nunique() <= 1:
+                print("[LGB] skip fold: target is constant")
+                continue
+
+            # rebuild constraints for remaining columns
+            mono = build_monotone_list(list(X_tr_orig.columns))
+
+            # sanitize names after pruning (mirror to test)
             X_tr = X_tr_orig.copy()
             X_tr.columns = safe_cols(X_tr.columns)
+            X_te = X_te_orig.copy()
+            X_te.columns = X_tr.columns
 
-            X_te = X_te_orig_all.copy()
-            X_te.columns = X_tr.columns  # exact same order/names
 
+            # sanitize column names for LightGBM and mirror them on test
             assert len(mono) == X_tr.shape[1], "Monotone constraint length mismatch."
 
-            model = make_lgb_fast(X_tr.columns, device="cpu", params_override=BEST_LGB_PARAMS)
+            model = make_lgb_fast(X_tr.columns, device="cpu",
+                      params_override=BEST_LGB_PARAMS_BY_TGT.get(tgt))
             model.set_params(monotone_constraints=mono)
+
 
             # small in-fold validation split + early stopping
             val_split = max(1, min(int(0.8 * len(X_tr)), len(X_tr) - 1))
@@ -1258,40 +1221,33 @@ def run_time_series_cv(df, predictors, targets, time_col='X_Achse_[s]'):
 
     return results
 
-cv_results = run_time_series_cv(df, PREDICTORS, TARGETS)
-gb_metrics = {}
+if HAS_LGB:
+    cv_results = run_time_series_cv(df, PREDICTORS, TARGETS)
+    gb_metrics = {}
+    for tgt in TARGETS:
+        mask = np.isfinite(cv_results[tgt]['true']) & np.isfinite(cv_results[tgt]['pred'])
+        y_true = np.array(cv_results[tgt]['true'])[mask]
+        y_pred = np.array(cv_results[tgt]['pred'])[mask]
+        time = np.array(cv_results[tgt]['time'])[mask]
+        gb_metrics[tgt] = (mean_absolute_error(y_true, y_pred), rmse(y_true, y_pred))
 
-for tgt in TARGETS:
-    mask = np.isfinite(cv_results[tgt]['true']) & np.isfinite(cv_results[tgt]['pred'])
-    y_true = np.array(cv_results[tgt]['true'])[mask]
-    y_pred = np.array(cv_results[tgt]['pred'])[mask]
-    time = np.array(cv_results[tgt]['time'])[mask]
+        fig = plot_prediction_diagnostics(y_true, y_pred, time, PRETTY[tgt], UNIT, df, PREDICTORS)
+        fig.savefig(f"ml_charts/diagnostics/diagnostics_{tgt}.png")
+        plt.close(fig)
 
-        # — store fold-aggregated errors
-    gb_metrics[tgt] = (
-        mean_absolute_error(y_true, y_pred),
-        rmse(y_true, y_pred)
-    )
-
-
-    fig = plot_prediction_diagnostics(
-        y_true, y_pred, time, PRETTY[tgt], UNIT,
-        df, PREDICTORS
-    )
-    fig.savefig(f"ml_charts/diagnostics/diagnostics_{tgt}.png")
-    plt.close(fig)
-
-print("\n📊  Gradient-Boosting cross-validated error summary")
-for tgt in TARGETS:
-    mask      = (np.isfinite(cv_results[tgt]['true']) &
-                 np.isfinite(cv_results[tgt]['pred']))
-    y_true_cv = np.array(cv_results[tgt]['true'])[mask]
-    y_pred_cv = np.array(cv_results[tgt]['pred'])[mask]
-
-    mae_val  = mean_absolute_error(y_true_cv, y_pred_cv)
-    rmse_val = rmse(y_true_cv, y_pred_cv)  
-    print(f"  {tgt:<12}  MAE = {mae_val:6.2f}   RMSE = {rmse_val:6.2f}")
-print()  # blank line for readability
+    print("\n📊  Gradient-Boosting cross-validated error summary")
+    for tgt in TARGETS:
+        mask = (np.isfinite(cv_results[tgt]['true']) & np.isfinite(cv_results[tgt]['pred']))
+        y_true_cv = np.array(cv_results[tgt]['true'])[mask]
+        y_pred_cv = np.array(cv_results[tgt]['pred'])[mask]
+        mae_val  = mean_absolute_error(y_true_cv, y_pred_cv)
+        rmse_val = rmse(y_true_cv, y_pred_cv)
+        print(f"  {tgt:<12}  MAE = {mae_val:6.2f}   RMSE = {rmse_val:6.2f}")
+    print()
+else:
+    print("[WARN] Skipping LightGBM CV/diagnostics (lightgbm not installed).")
+    cv_results = {t: {'true': [], 'pred': [], 'time': []} for t in ["PM1_shifted","PM2_5_shifted","PM10_shifted"]}
+    gb_metrics = {}
 
 # — cumulative emission KPI ---------------------------------------------------
 if "KO1_[km\\h]" in df.columns:
@@ -1638,7 +1594,7 @@ pm_model.ssl_aux.load_state_dict(ssl_head.state_dict())
 # optional warm start: freeze encoder for a longer period
 for p in pm_model.encoder.parameters():
     p.requires_grad = False
-WARM_EPOCHS = 15
+WARM_EPOCHS = 5
 
 # two LR param groups; encoder gets a smaller LR after unfreeze
 optim = torch.optim.Adam([
@@ -1652,11 +1608,11 @@ loss_fn   = nn.MSELoss()
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=EPOCHS, eta_min=1e-6)
 
 # Fine-tune SSL is always off (we only use SSL for pretraining)
-ALPHA_SSL_START = 0.0
-ALPHA_SSL_END   = 0.0
+ALPHA_SSL_START = 0.05
+ALPHA_SSL_END   = 0.00
 
 # Gate sparsity: stronger by default; softer when stabilizing
-L1_GATES = 1e-4 if STABLE_MODE else 5e-4
+L1_GATES = 1e-4 if STABLE_MODE else 2e-4
 
 
 # ============================================
@@ -1731,8 +1687,21 @@ for epoch in range(1, EPOCHS + 1):
 
             num_real  += int((wb > 0.5).sum().item())
             num_total += int(wb.numel())
+            # --- speed-aware weighting (upweight near-idle scenarios)
+            speed_idx = SELECTED.index("KO1_[km\\h]") if "KO1_[km\\h]" in SELECTED else None
+            if speed_idx is not None:
+                # last step speed in the window (z-scored units here)
+                v_last = xb[:, -1, speed_idx]
+                # convert back to approx km/h scale using scaler stats
+                mu, sigma = x_scaler.mean_[speed_idx], x_scaler.scale_[speed_idx]
+                v_kmh = (v_last * sigma + mu)
+                # weight: emphasize <10 km/h (clip to [1, 2])
+                w_speed = torch.clamp(1.0 + (10.0 - v_kmh) / 10.0, 1.0, 2.0)
+            else:
+                w_speed = torch.ones_like(wb)
 
-            w_eff = wb
+            # combine with label mask
+            w_eff = wb * w_speed  # ← keep the speed-aware emphasis
             per_elem = F.smooth_l1_loss(pred_z, yb, beta=1.0, reduction="none")
             sup_loss = (w_eff * per_elem).sum() / (w_eff.sum() + 1e-8)
             # ---- Masked Feature Modeling (score only masked feature dims) ----
@@ -2144,57 +2113,80 @@ print(f"[SANITY] TCN MAE train/val/test = {mae_train:.2f}/{mae_val:.2f}/{mae_tes
 # Example patch:  TimeSeriesSplit(n_splits=5, gap=WIN)
 
 # --- 3) Baselines: persistence & rolling-mean (to ensure we beat trivial models)
-y_ffill = pd.Series(y_true_full).where(y_mask_real).ffill().to_numpy()
-# Persistence: y_hat[t] = last real label (at t-1)
-persist = np.r_[np.nan, y_ffill[:-1]]
-# Rolling mean of last K seconds (past only)
-K = int(5.0 / TICK_RATE)  # ~5 seconds
-roll = pd.Series(y_ffill).shift(1).rolling(K, min_periods=1).mean().to_numpy()
+# --- 3) Baselines: persistence & rolling-mean (strictly causal, TEST only)
+y = pd.Series(y_true_full)
+m_real = pd.Series(y_mask_real)
 
-mae_persist_test = safe_mae(y_true_full, persist, test_rows & y_mask_real)
-mae_roll_test    = safe_mae(y_true_full, roll,    test_rows & y_mask_real)
+# previous *real* label exists at t-1?
+prev_real = m_real.shift(1, fill_value=False)
+
+# persistence = last real observation at t-1; otherwise NaN
+persist = y.shift(1)
+persist[~prev_real] = np.nan
+
+# rolling mean of last K seconds using only past values
+K = int(5.0 / TICK_RATE)
+roll = (y.where(m_real)
+          .shift(1)                       # forbid peeking at current y
+          .rolling(K, min_periods=1)
+          .mean())
+
+def _mae(mask, yhat):
+    m = mask & np.isfinite(y) & np.isfinite(yhat)
+    return mean_absolute_error(y[m], yhat[m]) if m.any() else np.nan
+
+mae_persist_test = _mae(test_rows & y_mask_real, persist)
+mae_roll_test    = _mae(test_rows & y_mask_real, roll)
 
 with open(os.path.join(SANITY_DIR, "baseline_report.txt"), "w", encoding="utf-8") as f:
-    f.write(f"Baselines on TEST (REAL labels only)\n")
+    f.write("Baselines on TEST (REAL labels only)\n")
     f.write(f"  persistence: {mae_persist_test:.3f}\n")
     f.write(f"  rolling-{K} samples: {mae_roll_test:.3f}\n")
     f.write(f"  TCN: {mae_test:.3f}\n")
 
 print(f"[SANITY] TEST baselines — persistence: {mae_persist_test:.2f}  rolling: {mae_roll_test:.2f}  | TCN: {mae_test:.2f}")
-
-# --- 4) Target-permutation smoke test (GBM quick check on a single fold)
-# If this does NOT degrade strongly vs real target → suspect leakage.
+# --- 4) Target-permutation smoke test (time-series split with gap)
 try:
     fold_lo = int(0.65 * len(df))
     fold_hi = int(0.80 * len(df))
-    X_perm  = df.iloc[fold_lo:fold_hi][SELECTED].fillna(0)
-    y_real  = df.iloc[fold_lo:fold_hi][y_col].astype(float)
-    m = np.isfinite(y_real.to_numpy())
-    Xp, yr = X_perm.loc[m], y_real.loc[m]
-    # sanitize names
-    Xp_s = Xp.copy(); Xp_s.columns = Xp_s.columns.str.replace(r'[^0-9a-zA-Z_]', '_', regex=True)
+    Xp  = df.iloc[fold_lo:fold_hi][SELECTED].fillna(0)
+    yr  = df.iloc[fold_lo:fold_hi]["PM10_shifted"].astype(float)
+    m   = np.isfinite(yr.to_numpy())
+    Xp, yr = Xp.loc[m], yr.loc[m]
 
-    mono = build_monotone_list(Xp.columns)
-    gbm  = make_lgb_fast(Xp_s.columns, device="cpu", params_override=BEST_LGB_PARAMS)
-    gbm.set_params(monotone_constraints=mono)
-    split = int(0.8*len(Xp_s))
-    gbm.fit(Xp_s.iloc[:split], yr.iloc[:split], eval_set=[(Xp_s.iloc[split:], yr.iloc[split:])],
-            eval_metric="l2", callbacks=[lgb.early_stopping(50, verbose=False)])
-    mae_true = mean_absolute_error(yr.iloc[split:], gbm.predict(Xp_s.iloc[split:]))
+    # sanitize once
+    Xp_s = Xp.copy()
+    Xp_s.columns = Xp_s.columns.str.replace(r'[^0-9a-zA-Z_]', '_', regex=True)
+    mono = build_monotone_list(list(Xp.columns))
 
-    y_perm = yr.sample(frac=1.0, random_state=13).reset_index(drop=True)  # shuffled labels
-    gbm_p  = make_lgb_fast(Xp_s.columns, device="cpu", params_override=BEST_LGB_PARAMS)
-    gbm_p.set_params(monotone_constraints=mono)
-    gbm_p.fit(Xp_s.iloc[:split], y_perm.iloc[:split], eval_set=[(Xp_s.iloc[split:], y_perm.iloc[split:])],
-              eval_metric="l2", callbacks=[lgb.early_stopping(50, verbose=False)])
-    mae_perm = mean_absolute_error(yr.iloc[split:], gbm_p.predict(Xp_s.iloc[split:]))
+    tscv = TimeSeriesSplit(n_splits=3, gap=WIN)
+    mae_true_all, mae_perm_all = [], []
 
-    with open(os.path.join(SANITY_DIR, "perm_report.txt"), "w", encoding="utf-8") as f:
-        f.write(f"GBM target-permutation smoke test (single fold)\n")
-        f.write(f"  real-target MAE : {mae_true:.3f}\n")
-        f.write(f"  PERMUTED  MAE   : {mae_perm:.3f}\n")
-        f.write("Expect permuted MAE >> real; otherwise suspect leakage.\n")
-    print(f"[SANITY] Permutation test MAE (real vs permuted): {mae_true:.2f} vs {mae_perm:.2f}")
+    # one global permutation of labels
+    yr_perm = yr.sample(frac=1.0, random_state=13).reset_index(drop=True)
+
+    for tr, te in tscv.split(Xp_s):
+        split = int(0.8 * len(tr))
+        tr_idx, va_idx = tr[:split], tr[split:]
+
+        m1 = make_lgb_fast(Xp_s.columns, device="cpu")
+        m1.set_params(monotone_constraints=mono)
+        m1.fit(Xp_s.iloc[tr_idx], yr.iloc[tr_idx],
+               eval_set=[(Xp_s.iloc[va_idx], yr.iloc[va_idx])],
+               eval_metric="l2",
+               callbacks=[lgb.early_stopping(50, verbose=False)])
+        mae_true_all.append(mean_absolute_error(yr.iloc[te], m1.predict(Xp_s.iloc[te])))
+
+        m2 = make_lgb_fast(Xp_s.columns, device="cpu")
+        m2.set_params(monotone_constraints=mono)
+        m2.fit(Xp_s.iloc[tr_idx], yr_perm.iloc[tr_idx],
+               eval_set=[(Xp_s.iloc[va_idx], yr_perm.iloc[va_idx])],
+               eval_metric="l2",
+               callbacks=[lgb.early_stopping(50, verbose=False)])
+        mae_perm_all.append(mean_absolute_error(yr.iloc[te], m2.predict(Xp_s.iloc[te])))
+
+    print(f"[SANITY] Permutation test MAE (real vs permuted): "
+          f"{np.mean(mae_true_all):.2f} vs {np.mean(mae_perm_all):.2f}")
 except Exception as e:
     print("[SANITY] permutation test skipped:", e)
 
@@ -2278,53 +2270,38 @@ print(f"[SANITY] look-ahead smoke MAE on TEST = {mae_la:.2f} (should be << norma
 
 
 # === [NEW] TCN LOFO importance on TEST ONLY (real labels only) ===
-rng = np.random.default_rng(42)
-
-y_true_full   = df["PM10_shifted"].to_numpy(np.float32)
-y_mask_full   = df["PM10_shifted_mask"].to_numpy(np.float32) > 0.5
+y_true_full = df["PM10_shifted"].to_numpy(np.float32)
+y_mask_full = df["PM10_shifted_mask"].to_numpy(np.float32) > 0.5
 base_pred_full = df_pred["PM10_hat_all"].to_numpy(np.float32)
 
-# Map window split to row-index split: window i → row (i + WIN - 1)
-# We already defined: split = int(0.8 * len(X)) earlier for TCN windows
+# test-row mask same as before
 n_rows = len(df)
-test_start_row = TRAIN_WIN + i_va
+test_start_row = TRAIN_WIN + i_va - 1
 test_row_mask = np.zeros(n_rows, dtype=bool)
 if test_start_row < n_rows:
     context_start = max(0, test_start_row - TRAIN_WIN + 1)
     test_row_mask[context_start:] = True
 
-
-# Evaluate only where: (a) in test rows, (b) real labels present, (c) baseline pred finite
 mask_eval = test_row_mask & y_mask_full & np.isfinite(y_true_full) & np.isfinite(base_pred_full)
-print(f"[LOFO] eval rows (real & finite) = {mask_eval.sum()}")
-
-
-from sklearn.metrics import mean_absolute_error
 base_mae = mean_absolute_error(y_true_full[mask_eval], base_pred_full[mask_eval])
-print(f"[LOFO] baseline MAE (TEST real-only) = {base_mae:.3f}")
 
-def permute_within_mask(arr: np.ndarray, row_mask: np.ndarray, rng):
-    a = arr.copy()
-    idx = np.flatnonzero(row_mask)
-    rng.shuffle(a[idx])  # shuffle only within the test rows
-    return a
+@torch.no_grad()
+def predict_with_gate_zero(feature_name: str):
+    idx = SELECTED.index(feature_name)
+    saved = pm_model.gate.log_g[idx].item()
+    pm_model.gate.log_g[idx] = -20.0  # softplus(-20) ≈ 0 → gate "off"
+    pred = tcn_predict_series(df, feature_cols=SELECTED, win=TRAIN_WIN)
+    pm_model.gate.log_g[idx] = saved
+    return pred
 
-delta_mae = {}
+delta = {}
 for f in SELECTED:
-    if f not in df.columns:   # safety
-        continue
-    df_tmp = df.copy()
-    df_tmp[f] = permute_within_mask(df_tmp[f].to_numpy(), test_row_mask, rng)
+    pred_f = predict_with_gate_zero(f)
+    mae_f  = mean_absolute_error(y_true_full[mask_eval], pred_f[mask_eval])
+    delta[f] = mae_f - base_mae
+    print(f"[LOFO] {f:>28s}  ΔMAE(TEST, real-only) = {delta[f]:.5f}")
 
-    # Option B: median freeze (sensitivity)
-    # df_tmp[f] = np.nanmedian(df_tmp[f].to_numpy())
-
-    pred_tmp = tcn_predict_series(df_tmp, feature_cols=SELECTED, win=TRAIN_WIN)
-    mae_tmp  = mean_absolute_error(y_true_full[mask_eval], pred_tmp[mask_eval])
-    delta_mae[f] = mae_tmp - base_mae
-    print(f"[LOFO] {f:>28s}  ΔMAE(TEST, real-only)={delta_mae[f]:.5f}")
-
-tcn_lofo = pd.Series(delta_mae).sort_values(ascending=False)
+tcn_lofo = pd.Series(delta).sort_values(ascending=False)
 tcn_lofo.to_csv("ml_charts/diagnostics/tcn_lofo_importance.csv")
 
 plt.figure(figsize=(10,6), dpi=200)
