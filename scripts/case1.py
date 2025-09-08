@@ -13,13 +13,10 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 from collections import defaultdict
-from pathlib import Path                   # NEW
-from torch.nn.utils import clip_grad_norm_ # NEW (global grad curve)  
-import torch.nn.functional as F  # for SmoothL1 (Huber) loss
-from pathlib import Path                   # NEW
-from torch.nn.utils import clip_grad_norm_ # NEW (global grad curve)  
-import torch.nn.functional as F 
-# ── Dependency guards (run even if some packages are missing)
+from pathlib import Path                   
+from torch.nn.utils import clip_grad_norm_  
+import torch.nn.functional as F  # for SmoothL1 (Huber) loss                    
+
 try:
     from filterpy.kalman import ExtendedKalmanFilter
     HAS_FILTERPY = True
@@ -109,7 +106,7 @@ def build_monotone_list(feature_names):
     mono_map = {
         "KO1_[km\\h]"           : +1,  # Speed ↑ → PM ↑
         "Pitch_Angle_[Grad]"    : +1,
-        "a_long"                : +1,
+        "a_long"                : 0,
         "BR2_Querbeschl_[m/s²]" : +1,
     }
     return [mono_map.get(c, 0) for c in feature_names]
@@ -525,9 +522,9 @@ if {"Latitude", "Longitude"}.issubset(df.columns):
     df["Longitude_[deg]"] = smart_geo(df["Longitude"])
 
     for col in ["Latitude_[deg]", "Longitude_[deg]"]:
-        s = df[col].replace(0, np.nan)
-        s = s.ffill().bfill()
+        s = df[col].replace(0, np.nan).ffill()              # no bfill (no future peeking)
         df[col] = s.ewm(alpha=0.5, adjust=False).mean()
+
 
     # WGS84 → Web-Mercator
     if HAS_PYPROJ:
@@ -571,18 +568,28 @@ if {"Latitude", "Longitude"}.issubset(df.columns):
 
     # EKF / fallback smoothing
     dt = TICK_RATE
-    if HAS_FILTERPY:
-        # (same EKF code you had; unchanged)
-        ...
-        # keep your exact EKF loop & assignments to X_f, Y_f, V_f, Psi_f, r_f
-    else:
+
+    def _fallback_path_smoothing():
         df["X_f"] = df["X_m"].rolling(5, min_periods=1).median()
         df["Y_f"] = df["Y_m"].rolling(5, min_periods=1).median()
         dx = df["X_f"].diff().fillna(0.0); dy = df["Y_f"].diff().fillna(0.0)
         df["V_f"] = np.hypot(dx, dy) / dt
         psi_unwrapped = np.unwrap(np.deg2rad(df["Heading_deg"].astype(float).to_numpy()))
-        df["Psi_f"] = psi_unwrapped
-        df["r_f"]   = pd.Series(np.gradient(df["Psi_f"].to_numpy(), dt), index=df.index)
+        df["Psi_f"] = pd.Series(psi_unwrapped, index=df.index)
+        df["r_f"]   = df["Psi_f"].diff().fillna(0.0) / dt    # rad/s, causal
+
+
+    try:
+        if HAS_FILTERPY:
+            # TODO: drop in your EKF here and assign the 5 columns below.
+            # Until then, keep behavior consistent by using the fallback:
+            _fallback_path_smoothing()
+        else:
+            _fallback_path_smoothing()
+    except Exception as e:
+        print("[EKF] failed, using fallback:", e)
+        _fallback_path_smoothing()
+
 
     # back to lat/lon
     if HAS_PYPROJ:
@@ -628,15 +635,14 @@ df["Heading_rate_[deg_s]"] = (
 
 
 # 2) Pure-GPS speed series  (km/h ➜ m/s)  with tiny-gap interpolation
-df["V_gps_ms"] = df["V_gps_ms"].replace(0, np.nan).ffill()
-# If the series starts with NaN, fill just the very beginning once:
-df["V_gps_ms"] = df["V_gps_ms"].bfill()
+df["V_gps_ms"] = df["V_gps_ms"].replace(0, np.nan).ffill().fillna(0.0)
 
 
 # 3) Curvature κ = yaw-rate / speed   (guard against div-by-0)
+# Causal curvature κ = yaw_rate / speed
 df["Curvature_[1_m]"] = (
-    df["r_f"] / df["V_gps_ms"].clip(lower=0.1)   # never <0.1 m/s
-).replace([np.inf, -np.inf], 0)
+    df["r_f"] / df["V_gps_ms"].clip(lower=0.1)
+).replace([np.inf, -np.inf], 0.0)
 
 #--------------------------------------------------------------------------------------------------
 def plot_prediction_diagnostics(y_true, y_pred, time,
@@ -725,16 +731,38 @@ weights       = {"Front_Left":681, "Front_Right":630,
                  "Rear_Left":464.5, "Rear_Right":484}
 vehicle_mass  = sum(weights.values())
 L             = 3.0                               # wheel-base [m]
-h_cg          = (weights["Rear_Left"]+weights["Rear_Right"])*L/(vehicle_mass*2)
-track_front   = (1622+1634)/2000 + 0.06
+x_cg = ((weights["Rear_Left"] + weights["Rear_Right"]) / vehicle_mass) * L
+H_CG_DEFAULT = 0.62   # tweak to 0.65–0.70 m when the van is loaded / roof rack, etc.
+h_cg = float(H_CG_DEFAULT)
 static_FR     = weights["Front_Right"] * G
 FR_share      = weights["Front_Right"]/(weights["Front_Left"]+weights["Front_Right"])
 
-df["deltaFz_long"]      = df["a_long"] * vehicle_mass * h_cg / L
-df["deltaFz_lat_front"] = df["a_lat"]  * vehicle_mass * h_cg / track_front
+# --- Front-right dynamic load (warning-proof version) ---
 
-df["Fz_FR_dynamic"] = (static_FR + FR_share*df["deltaFz_long"]
-                       +0.5*df["deltaFz_lat_front"]).clip(lower=0.1*static_FR)
+# measured front track (m) — no arbitrary +0.06
+track_front = (1622.0 + 1634.0) / 2000.0  # ≈ 1.628
+
+# ensure clean float Series
+a_x = pd.to_numeric(df["a_long"], errors="coerce").astype(float)
+a_y = pd.to_numeric(df["a_lat"],  errors="coerce").astype(float)
+
+# total longitudinal transfer (positive a_x = accel → unloads front axle)
+df.loc[:, "deltaFz_long"] = a_x * vehicle_mass * h_cg / L
+
+# fraction of lateral transfer that goes to front axle (roll stiffness split)
+lambda_front = 0.55
+df.loc[:, "deltaFz_lat_front"] = lambda_front * (vehicle_mass * a_y * h_cg / track_front)
+
+# sign convention: +a_y loads RIGHT side; flip sign if your data is opposite
+lat_sign = pd.Series(np.sign(a_y.to_numpy()), index=df.index).fillna(0.0)
+
+# Front-Right dynamic normal load
+df.loc[:, "Fz_FR_dynamic"] = (
+    static_FR
+    - FR_share * df["deltaFz_long"]             # accel unloads front axle
+    + 0.5 * lat_sign * df["deltaFz_lat_front"]  # outside front gets +, inside −
+).clip(lower=0.1 * static_FR)
+
 
 # temperature μ
 if USE_DYNAMIC_MU and "KO2_Aussen_T_[Grad_Celsius]" in df.columns:
@@ -884,13 +912,18 @@ idle = (
     (df["lambda_y"].abs() < .05)
 )
 
-dyn_mask = ~idle                               # rows that enter K-Means
+dyn_mask = ~idle
 scaler   = StandardScaler()
-X_reg    = scaler.fit_transform(df.loc[dyn_mask, regime_cols].fillna(0))
+n_dyn    = int(dyn_mask.sum())
 
-kmeans   = KMeans(n_clusters=5, random_state=42, n_init=10)
-df.loc[dyn_mask, "regime"] = kmeans.fit_predict(X_reg) + 1   # 1-5
-df.loc[idle,     "regime"] = 0                               # idle
+if n_dyn >= 5:
+    X_reg  = scaler.fit_transform(df.loc[dyn_mask, regime_cols].fillna(0))
+    kmeans = KMeans(n_clusters=5, random_state=42, n_init=10)
+    df.loc[dyn_mask, "regime"] = kmeans.fit_predict(X_reg) + 1  # 1..5
+    df.loc[idle, "regime"] = 0
+else:
+    df["regime"] = 0
+    print(f"[KMeans] skipped: only {n_dyn} dynamic rows")
 df["regime"] = df["regime"].astype(int)
 
 
@@ -909,8 +942,13 @@ for tgt in TARGETS:
     y1, y2 = df1[tgt], df2[tgt]
 
 
-    rf1, X1_safe = lgb_fit(X1, y1, tgt=tgt)
-    rf2, X2_safe = lgb_fit(X2, y2, tgt=tgt)
+    try:
+        rf1, X1_safe = lgb_fit(X1, y1, tgt=tgt)
+        rf2, X2_safe = lgb_fit(X2, y2, tgt=tgt)
+    except ValueError as e:
+        print(f"[LGB] {tgt}: skipped one/both segments — {e}")
+        continue
+
 
     # Use the exact rows LightGBM saw (X*_safe index) to align y
     y1_safe = y1.loc[X1_safe.index]
@@ -1882,7 +1920,9 @@ def tcn_predict_series(df_src: pd.DataFrame, feature_cols=SELECTED, win=TRAIN_WI
     full[win:] = pred
     return full
 pred_full = tcn_predict_series(df, feature_cols=SELECTED, win=TRAIN_WIN)
-print("first finite pred index:", np.flatnonzero(np.isfinite(pred_full))[0])  # should be == TRAIN_WIN
+_idx = np.flatnonzero(np.isfinite(pred_full))
+print("first finite pred index:", int(_idx[0]) if len(_idx) else "none")
+ # should be == TRAIN_WIN
 
 # Show learned feature weights (the “importance” your model discovered)
 # Show learned feature weights (the “importance” your model discovered)
