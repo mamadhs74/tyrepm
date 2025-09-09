@@ -1303,39 +1303,57 @@ if "KO1_[km\\h]" in df.columns:
 print("✅  Plots & CSVs written under ./ml_charts/")
 #ßßßßßßßßßßßßßßßßßßßßßßßßß
 def save_geo_multi_pm_plot(df, mask=None):
+    """Scatter emissions on top of an OpenStreetMap basemap."""
+    # default: all rows
     if mask is None:
         mask = df.index
-    """Scatter emissions on top of an OpenStreetMap basemap."""
-    fig, axes = plt.subplots(
-        3, 1, figsize=(11, 14), dpi=300,
-        sharex=True, gridspec_kw=dict(hspace=0.25)
-    )
+
+    # If a boolean mask (Series/ndarray) is passed, convert to index positions.
+    if isinstance(mask, (pd.Series, np.ndarray)):
+        # pandas-friendly check for boolean dtype
+        from pandas.api.types import is_bool_dtype
+        if is_bool_dtype(mask):
+            if len(mask) != len(df):
+                raise ValueError(f"Mask length {len(mask)} != df length {len(df)}")
+            mask = df.index[mask]
+
+    # required columns
+    needed = {"Lat_filt", "Lon_filt"}
+    missing = needed - set(df.columns)
+    if missing:
+        raise KeyError(f"Missing columns for map: {missing} "
+                       "(run the GPS preprocessing that creates Lat_filt/Lon_filt)")
+
+    fig, axes = plt.subplots(3, 1, figsize=(11, 14), dpi=300,
+                             sharex=True, gridspec_kw=dict(hspace=0.25))
 
     spec = [
-        ("PM₁",   "PM1_shifted",   "Blues", 0),
-        ("PM₂.₅", "PM2_5_shifted", "Greens",1),
-        ("PM₁₀",  "PM10_shifted",  "Reds",  2)
+        ("PM₁",   "PM1_shifted",   "Blues",  0),
+        ("PM₂.₅", "PM2_5_shifted", "Greens", 1),
+        ("PM₁₀",  "PM10_shifted",  "Reds",   2),
     ]
 
     for label, col, cmap, idx in spec:
         ax = axes[idx]
 
+        if col not in df.columns:
+            ax.set_title(f"{label} (missing)")
+            continue
+
         sc = ax.scatter(
             df.loc[mask, "Lon_filt"],
             df.loc[mask, "Lat_filt"],
             c=df.loc[mask, col],
-            cmap=cmap, s=8, alpha=0.8,
-            edgecolors="none"
+            cmap=cmap, s=8, alpha=0.8, edgecolors="none"
         )
 
-        # add OSM basemap (EPSG:4326 lon/lat)
+        # Optional basemap
         if HAS_CTX and USE_BASEMAPS:
             try:
                 ctx.add_basemap(ax, crs="EPSG:4326",
                                 source=ctx.providers.OpenStreetMap.Mapnik)
             except Exception as e:
                 print("[map] basemap skipped:", e)
-
 
         cb = fig.colorbar(sc, ax=ax, fraction=0.03, pad=0.01)
         cb.ax.set_ylabel(f"{label} [{UNIT}]")
@@ -1345,12 +1363,12 @@ def save_geo_multi_pm_plot(df, mask=None):
     axes[-1].set_xlabel("Longitude [°]")
     axes[1].set_ylabel("Latitude [°]")
     fig.suptitle("Tyre-wear particulate concentration along driven path", fontsize=15)
-    
 
     out = "ml_charts/diagnostics/pm_pathmap_ALL.png"
     fig.savefig(out, dpi=300)
     plt.close(fig)
-    return out 
+    return out
+
 
 save_geo_multi_pm_plot(df)
 
@@ -1457,13 +1475,16 @@ def make_windows_masked_with_next(features, target, target_mask, win=512, horizo
       X_next: (N, F)
     """
     Xs, ys, ws, Xn = [], [], [], []
-    T = len(target)
-    # stop one step earlier so we can take the "next" vector safely
+    T, F = len(target), features.shape[1]
     for i in range(T - win - horizon):
         Xs.append(features[i:i+win, :])
         ys.append(target[i+win+horizon-1])
         ws.append(target_mask[i+win+horizon-1])
-        Xn.append(features[i+win+horizon, :])  # next-step features
+        Xn.append(features[i+win+horizon, :])
+
+    if not Xs:  # return valid empty tensors instead of crashing
+        empty = lambda *shape: torch.empty(*shape, dtype=torch.float32)
+        return empty(0, win, F), empty(0), empty(0), empty(0, F)
 
     return (
         torch.tensor(np.stack(Xs), dtype=torch.float32),
@@ -1472,37 +1493,20 @@ def make_windows_masked_with_next(features, target, target_mask, win=512, horizo
         torch.tensor(np.stack(Xn), dtype=torch.float32)
     )
 
-# Build from full imputed features + pseudo labels (scaled)
-# Defensive guard: if any feature still missing (e.g., toggled lists), create it.
-for c in feat_cols_for_model:
-    if c not in df.columns:
-        df[c] = 0.0
-
-feat_mat_full = df[feat_cols_for_model].to_numpy(np.float32)
-feat_mat_full = x_scaler.transform(feat_mat_full)
-feat_mat_full = clip_features(feat_mat_full, 6.0)
-
-y_pm10_full = df["PM10_shifted"].to_numpy(np.float32)   # REAL labels
-y_pm10_full_z = safe_transform_y(y_pm10_full)
-w_pm10_full = df["PM10_shifted_mask"].to_numpy(np.float32)
-
-X, y, w, X_next = make_windows_masked_with_next(
-    feat_mat_full, y_pm10_full_z, w_pm10_full, win=WIN, horizon=1
-)
-
-
-# === Define model feature list once (after SELECTED + EXTRA_FEATS are final)
-
-
 def make_ssl_windows(features, win=WIN):
     """
-    Inputs:  X_ssl  shape (N, win, F)
-    Targets: Y_ssl  shape (N, F) = features at next step (t = i+win)
+    Self-supervised windows for next-step prediction.
+    Returns (X_ssl, Y_ssl) or empty tensors if sequence is too short.
     """
     Xs, ys = [], []
-    for i in range(len(features) - win):
+    T, F = features.shape
+    for i in range(T - win):
         Xs.append(features[i:i+win, :])
-        ys.append(features[i+win, :])     # next-step vector
+        ys.append(features[i+win, :])
+
+    if not Xs:
+        return torch.empty(0, win, F), torch.empty(0, F)
+
     return torch.tensor(np.stack(Xs), dtype=torch.float32), \
            torch.tensor(np.stack(ys), dtype=torch.float32)
 
@@ -1522,8 +1526,10 @@ ssl_train = TensorDataset(X_ssl[:ssl_split], Y_ssl[:ssl_split])
 ssl_loader = DataLoader(ssl_train, batch_size=64, shuffle=True)
 
 # ===  ==============================
-encoder  = TCNEncoder(input_size=X.shape[-1], num_channels=CHANNELS, kernel_size=5, dropout=0.15).to(DEVICE)
-ssl_head = SSLHead(in_dim=encoder.outdim, out_dim=X.shape[-1]).to(DEVICE)
+n_feat_ssl = X_ssl.shape[-1]
+encoder  = TCNEncoder(input_size=n_feat_ssl, num_channels=CHANNELS, kernel_size=5, dropout=0.15).to(DEVICE)
+ssl_head = SSLHead(in_dim=encoder.outdim, out_dim=n_feat_ssl).to(DEVICE)
+
 register_nan_hooks(encoder,  name="SSL_Encoder")
 register_nan_hooks(ssl_head, name="SSL_Head")
 for m in encoder.modules():
@@ -1564,6 +1570,45 @@ for e in range(1, SSL_EPOCHS + 1):
 
 
 # memory guard – keep it, but stricter
+
+
+# ---- Correlation-based gate init (train-only) ----
+feat_df_train = pd.DataFrame(feat_mat[:split_idx], columns=SELECTED)
+y_train_raw   = tgt_vec[:split_idx]  # unscaled target for correlations
+
+corrs = []
+for c in SELECTED:
+    x = np.asarray(feat_df_train[c], dtype=np.float64)
+    if np.allclose(x.std(), 0):
+        corrs.append(0.0)
+        continue
+    xc = (x - x.mean()) / (x.std() + 1e-8)
+    yc = (y_train_raw - y_train_raw.mean()) / (y_train_raw.std() + 1e-8)
+    corrs.append(float(np.clip(np.corrcoef(xc, yc)[0, 1], -1, 1)))
+
+corr_abs = np.abs(np.nan_to_num(corrs, nan=0.0))
+corr_norm = corr_abs / (corr_abs.max() + 1e-8) if corr_abs.max() > 0 else corr_abs
+gate_init_vec = 0.2 + 0.8 * corr_norm  # keep >0 to avoid dead gates
+
+
+# --- supervised windows for PM10 (use z-scored target and real-label mask) ---
+# y_pm10_full, y_scaler, feat_mat, WIN are already defined above
+w_pm10_full = df.get("PM10_shifted_mask", pd.Series(0.0, index=df.index)).to_numpy(np.float32)
+y_z = safe_transform_y(y_pm10_full)  # map raw PM10 to Z-space using TRAIN-only scaler
+
+X, y, w, X_next = make_windows_masked_with_next(
+    features=feat_mat.astype(np.float32),   # already scaled & clipped earlier
+    target=y_z.astype(np.float32),
+    target_mask=w_pm10_full.astype(np.float32),
+    win=WIN,
+    horizon=1,
+)
+
+if X.numel() == 0:
+    raise ValueError(f"Not enough rows to make windows (need > {WIN+1}).")
+
+
+# memory guard – keep it, but stricter
 if X.numel() > 2e8:                       # 100 M floats ≈ 400 MB
     raise MemoryError("Lower WIN or CHANNELS; GPU would OOM.")
 # ────────────────────────────────────────────────────────────────────────────
@@ -1585,29 +1630,7 @@ train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
 val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False)
 test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False)
 
-
-
-
 n_feat = X.shape[-1]
-
-
-# ---- Correlation-based gate init (train-only) ----
-feat_df_train = pd.DataFrame(feat_mat[:split_idx], columns=SELECTED)
-y_train_raw   = tgt_vec[:split_idx]  # unscaled target for correlations
-
-corrs = []
-for c in SELECTED:
-    x = np.asarray(feat_df_train[c], dtype=np.float64)
-    if np.allclose(x.std(), 0):
-        corrs.append(0.0)
-        continue
-    xc = (x - x.mean()) / (x.std() + 1e-8)
-    yc = (y_train_raw - y_train_raw.mean()) / (y_train_raw.std() + 1e-8)
-    corrs.append(float(np.clip(np.corrcoef(xc, yc)[0, 1], -1, 1)))
-
-corr_abs = np.abs(np.nan_to_num(corrs, nan=0.0))
-corr_norm = corr_abs / (corr_abs.max() + 1e-8) if corr_abs.max() > 0 else corr_abs
-gate_init_vec = 0.2 + 0.8 * corr_norm  # keep >0 to avoid dead gates
 
 # === REPLACE OLD SUPERVISED TCN TRAINING WITH THIS =========================
 # === SELF-/SEMI-SUPERVISED FINETUNE (robust + SSL aux) =====================
@@ -1739,9 +1762,16 @@ for epoch in range(1, EPOCHS + 1):
                 w_speed = torch.ones_like(wb)
 
             # combine with label mask
-            w_eff = wb * w_speed  # ← keep the speed-aware emphasis
+            # combine with label mask and speed weighting
+            w_eff = wb * w_speed  # shape (B,)
+
+            # fallback if a batch has no supervised signal at all
+            if w_eff.sum() < 1e-6:
+                w_eff = torch.ones_like(w_eff) * 0.1  # weak supervision fallback
+
             per_elem = F.smooth_l1_loss(pred_z, yb, beta=1.0, reduction="none")
             sup_loss = (w_eff * per_elem).sum() / (w_eff.sum() + 1e-8)
+
             # ---- Masked Feature Modeling (score only masked feature dims) ----
             xb_next_ = xb_next.to(DEVICE)                 # (B, F)
             with torch.no_grad():
@@ -2329,10 +2359,12 @@ base_mae = mean_absolute_error(y_true_full[mask_eval], base_pred_full[mask_eval]
 def predict_with_gate_zero(feature_name: str):
     idx = SELECTED.index(feature_name)
     saved = pm_model.gate.log_g[idx].item()
-    pm_model.gate.log_g[idx] = -20.0  # softplus(-20) ≈ 0 → gate "off"
-    pred = tcn_predict_series(df, feature_cols=SELECTED, win=TRAIN_WIN)
-    pm_model.gate.log_g[idx] = saved
-    return pred
+    try:
+        pm_model.gate.log_g[idx] = -20.0  # softplus(-20) ~ 0
+        return tcn_predict_series(df, feature_cols=SELECTED, win=TRAIN_WIN)
+    finally:
+        pm_model.gate.log_g[idx] = saved
+
 
 delta = {}
 for f in SELECTED:
