@@ -69,7 +69,8 @@ def register_nan_hooks(module: torch.nn.Module, name="model"):
             raise RuntimeError(f"[NaNGuard] Non-finite gradients in {name}:{mod.__class__.__name__} (backward)")
     for m in module.modules():
         m.register_forward_hook(_fwd_hook)
-        m.register_full_backward_hook(_bwd_hook)
+         # m.register_full_backward_hook(_bwd_hook)  # noisy + slow; rely on anomaly_guard()
+
 
 @contextmanager
 def anomaly_guard():
@@ -80,6 +81,85 @@ def anomaly_guard():
     finally:
         torch.autograd.set_detect_anomaly(old)
 # ========================================================
+# ====================== SANITY & DIAGNOSTICS UTILITIES ======================
+
+def _align_on_index(y, x):
+    y = y.copy().reset_index(drop=True)
+    x = x.copy().reset_index(drop=True)
+    return y, x
+
+def compute_persistence_and_rolling(y_test: pd.Series, test_idx: np.ndarray, window:int=5):
+    y = y_test.iloc[test_idx].copy().reset_index(drop=True)
+    y_pred_persist = y.shift(1)
+    y_pred_roll = y.rolling(window=window, min_periods=window).mean()
+    df = pd.DataFrame({"y": y, "persist": y_pred_persist, "roll": y_pred_roll}).dropna()
+    if len(df) == 0:
+        return np.nan, np.nan, 0
+    mae_persist = np.abs(df["y"] - df["persist"]).mean()
+    mae_roll = np.abs(df["y"] - df["roll"]).mean()
+    return float(mae_persist), float(mae_roll), int(len(df))
+
+def run_permutation_test(X: pd.DataFrame, y: pd.Series, tr_idx: np.ndarray, te_idx: np.ndarray, seed: int = 13):
+    Xr = X.reset_index(drop=True)
+    yr = y.reset_index(drop=True)
+    rs = np.random.RandomState(seed)
+    y_perm = yr.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+
+    def _fit_predict(X_train, y_train, X_test):
+        gb = lgb.LGBMRegressor(n_estimators=300, random_state=seed)
+        gb.fit(X_train, y_train)
+        return gb.predict(X_test)
+
+    y_pred_real = _fit_predict(Xr.iloc[tr_idx], yr.iloc[tr_idx], Xr.iloc[te_idx])
+    y_pred_perm = _fit_predict(Xr.iloc[tr_idx], y_perm.iloc[tr_idx], Xr.iloc[te_idx])
+
+    y_true = yr.iloc[te_idx].to_numpy()
+    mae_real = np.mean(np.abs(y_true - y_pred_real))
+    mae_perm = np.mean(np.abs(y_true - y_pred_perm))
+    return float(mae_real), float(mae_perm)
+
+def lookahead_smoke_checks(X: pd.DataFrame, y: pd.Series, tr_idx: np.ndarray, te_idx: np.ndarray, K:int=5, seed:int=42):
+    Xr = X.reset_index(drop=True).copy()
+    yr = y.reset_index(drop=True).copy()
+
+    # (A) BAD: shift features forward +K (should degrade)
+    X_bad = Xr.shift(+K)
+    valid_mask = X_bad.notna().all(axis=1)
+    tr = np.array([i for i in tr_idx if valid_mask.iloc[i]])
+    te = np.array([i for i in te_idx if valid_mask.iloc[i]])
+    gb_bad = lgb.LGBMRegressor(n_estimators=600, random_state=seed)
+    gb_bad.fit(X_bad.iloc[tr], yr.iloc[tr])
+    yhat_bad = gb_bad.predict(X_bad.iloc[te])
+    mae_bad = np.mean(np.abs(yr.iloc[te].to_numpy() - yhat_bad))
+
+    # (B) CHEAT: leak future target (should improve a lot)
+    X_cheat = Xr.copy()
+    X_cheat["target_t+K"] = yr.shift(-K)
+    valid_mask2 = X_cheat["target_t+K"].notna()
+    tr2 = np.array([i for i in tr_idx if valid_mask2.iloc[i]])
+    te2 = np.array([i for i in te_idx if valid_mask2.iloc[i]])
+    gb_cheat = lgb.LGBMRegressor(n_estimators=600, random_state=seed)
+    gb_cheat.fit(X_cheat.iloc[tr2], yr.iloc[tr2])
+    yhat_cheat = gb_cheat.predict(X_cheat.iloc[te2])
+    mae_cheat = np.mean(np.abs(yr.iloc[te2].to_numpy() - yhat_cheat))
+
+    return float(mae_bad), float(mae_cheat), int(len(te)), int(len(te2))
+
+def lofo_mae(model, X: pd.DataFrame, y: pd.Series, te_idx: np.ndarray, feature_names: list):
+    Xr = X.reset_index(drop=True)
+    yr = y.reset_index(drop=True)
+    y_true = yr.iloc[te_idx].to_numpy()
+    yhat_base = model.predict(Xr.iloc[te_idx])
+    mae_base = np.mean(np.abs(y_true - yhat_base))
+    results = []
+    for f in feature_names:
+        X_abl = Xr.copy()
+        X_abl[f] = X_abl[f].mean()  # hard ablation (mean-impute)
+        yhat = model.predict(X_abl.iloc[te_idx])
+        mae = np.mean(np.abs(y_true - yhat))
+        results.append((f, float(mae - mae_base)))
+    return sorted(results, key=lambda t: t[1], reverse=True), float(mae_base)
+# ============================================================================ 
 
 
 def safe_cols(cols):
@@ -129,8 +209,6 @@ def make_lgb_fast(feature_names, device="cpu", params_override=None):
         monotone_constraints=build_monotone_list(feature_names),
         random_state=42,
         n_jobs=-1,
-        min_data_in_leaf=10,
-        min_gain_to_split=0.0,
         max_depth=-1,
         verbosity=-1,
     )
@@ -1061,15 +1139,18 @@ UNIT    = "µg/m³"
 def make_objective(tgt_name: str):
     def objective(trial):
         params = {
-            "n_estimators": trial.suggest_int("n_estimators", 3000, 20000, step=2000),
-            "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.05, log=True),
-            "num_leaves": trial.suggest_int("num_leaves", 31, 255),
-            "max_depth": trial.suggest_int("max_depth", 4, 12),
-            "min_child_samples": trial.suggest_int("min_child_samples", 10, 120),
-            "subsample": trial.suggest_float("subsample", 0.6, 1.0),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
-            "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 1.0),
-        }
+    "n_estimators": trial.suggest_int("n_estimators", 3000, 19000, step=2000),
+    "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.05, log=True),
+    "num_leaves": trial.suggest_int("num_leaves", 31, 255),
+    "max_depth": trial.suggest_int("max_depth", 4, 12),
+    "min_child_samples": trial.suggest_int("min_child_samples", 10, 120),
+    "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+    "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+    "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 1.0),
+    "min_split_gain": trial.suggest_float("min_split_gain", 0.0, 0.5),
+    "random_state": 42,
+    "n_jobs": -1,
+    }
 
         tscv = TimeSeriesSplit(n_splits=5, gap=WIN)
         maes = []
@@ -1286,6 +1367,27 @@ else:
     print("[WARN] Skipping LightGBM CV/diagnostics (lightgbm not installed).")
     cv_results = {t: {'true': [], 'pred': [], 'time': []} for t in ["PM1_shifted","PM2_5_shifted","PM10_shifted"]}
     gb_metrics = {}
+    
+# --- GBM LOFO on full series with a time gap (safe, single split) ---
+if HAS_LGB and "PM10_shifted" in df.columns:
+    tgt = "PM10_shifted"
+    X_all = df[SELECTED].fillna(0)
+    y_all = df[tgt].astype(float)
+
+    N   = len(df)
+    gap = WIN
+    tr_end = int(0.8 * N) - gap
+    tr_idx = np.arange(0, max(tr_end, 1))
+    te_idx = np.arange(int(0.8 * N), N)
+
+    params = dict(objective="regression", random_state=42, n_jobs=-1)
+    params.update(BEST_LGB_PARAMS_BY_TGT.get(tgt, {}))
+    gbm = lgb.LGBMRegressor(**params)
+    gbm.fit(X_all.iloc[tr_idx], y_all.iloc[tr_idx])
+
+    lofo, lofo_base = lofo_mae(gbm, X_all, y_all, te_idx, feature_names=list(X_all.columns))
+    for f, d in lofo:
+        print(f"[LOFO] {f:>28}  ΔMAE(TEST) = {d:+.5f}")
 
 # — cumulative emission KPI ---------------------------------------------------
 if "KO1_[km\\h]" in df.columns:
@@ -1560,7 +1662,7 @@ for e in range(1, SSL_EPOCHS + 1):
         loss.backward()
         clip_grad_norm_(list(encoder.parameters()) + list(ssl_head.parameters()), 1.0)
         ssl_optim.step()
-        running += float(loss)
+        running += loss.item()
     print(f"[SSL] epoch {e:02d}  loss={running/len(ssl_loader):.4f}")
 # keep the pretrained weights; ssl_head not used afterwards
 
@@ -2030,7 +2132,7 @@ def log_gradient_norms(grad_history, out_path, max_series=25):
 diag_dir = Path("ml_charts/diagnostics")
 diag_dir.mkdir(parents=True, exist_ok=True)
 
-num_params = sum(1 for _ in pm_model.parameters())
+num_params = sum(p.numel() for p in pm_model.parameters())
 num_keys = len(grad_history)
 num_points = sum(len(v) for v in grad_history.values())
 print(f"[grad debug] train batches={len(train_loader)} | params={num_params} | "
@@ -2214,7 +2316,8 @@ with open(os.path.join(SANITY_DIR, "baseline_report.txt"), "w", encoding="utf-8"
     f.write(f"  rolling-{K} samples: {mae_roll_test:.3f}\n")
     f.write(f"  TCN: {mae_test:.3f}\n")
 
-print(f"[SANITY] TEST baselines — persistence: {mae_persist_test:.2f}  rolling: {mae_roll_test:.2f}  | TCN: {mae_test:.2f}")
+print(f"[SANITY] TEST baselines — persistence: {mae_persist_test:.2f}  rolling: {mae_roll_test:.2f}")
+
 # --- 4) Target-permutation smoke test (time-series split with gap)
 try:
     fold_lo = int(0.65 * len(df))
@@ -2255,8 +2358,9 @@ try:
                callbacks=[lgb.early_stopping(50, verbose=False)])
         mae_perm_all.append(mean_absolute_error(yr.iloc[te], m2.predict(Xp_s.iloc[te])))
 
-    print(f"[SANITY] Permutation test MAE (real vs permuted): "
-          f"{np.mean(mae_true_all):.2f} vs {np.mean(mae_perm_all):.2f}")
+    if mae_true_all and mae_perm_all:
+        print(f"[SANITY] Permutation test (folded) — real: {np.mean(mae_true_all):.2f}  permuted: {np.mean(mae_perm_all):.2f}")
+
 except Exception as e:
     print("[SANITY] permutation test skipped:", e)
 
@@ -2335,7 +2439,8 @@ with open(os.path.join(SANITY_DIR, "lookahead_smoke.txt"), "w") as f:
     f.write(f"TEST MAE with +1 step *future* features injected: {mae_la:.3f}\n")
     f.write("This number SHOULD be noticeably BETTER than baseline; "
             "if your normal model is *similar*, you might be leaking future info.\n")
-print(f"[SANITY] look-ahead smoke MAE on TEST = {mae_la:.2f} (should be << normal if future info helps)")
+mae_bad, mae_cheat, n1, n2 = lookahead_smoke_checks(X_all, y_all, tr_idx, te_idx, K=5, seed=42)
+print(f"[SANITY] look-ahead smoke (shift+K worse, cheat better): bad={mae_bad:.2f} (n={n1}) | cheat={mae_cheat:.2f} (n={n2})")
 # ======================================================================
 
 
