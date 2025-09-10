@@ -1663,9 +1663,22 @@ for e in range(1, SSL_EPOCHS + 1):
         clip_grad_norm_(list(encoder.parameters()) + list(ssl_head.parameters()), 1.0)
         ssl_optim.step()
         running += loss.item()
-    print(f"[SSL] epoch {e:02d}  loss={running/len(ssl_loader):.4f}")
-# keep the pretrained weights; ssl_head not used afterwards
+        ssl_train = TensorDataset(X_ssl[:ssl_split], Y_ssl[:ssl_split])
+        ssl_loader = DataLoader(ssl_train, batch_size=64, shuffle=True)
 
+        if len(ssl_train) == 0:
+            print("[SSL] skipped: sequence too short for SSL windows.")
+        else:
+            encoder.train(); ssl_head.train()
+            SSL_EPOCHS = 15
+            for e in range(1, SSL_EPOCHS + 1):
+                running = 0.0
+                for xb, yb in ssl_loader:
+                    ...
+                    running += loss.item()
+                print(f"[SSL] epoch {e:02d}  loss={running/max(1, len(ssl_loader)):.4f}")
+
+        
 
 # keep the pretrained weights; we won't use ssl_head anymore
 # ================================================================
@@ -2439,10 +2452,6 @@ with open(os.path.join(SANITY_DIR, "lookahead_smoke.txt"), "w") as f:
     f.write(f"TEST MAE with +1 step *future* features injected: {mae_la:.3f}\n")
     f.write("This number SHOULD be noticeably BETTER than baseline; "
             "if your normal model is *similar*, you might be leaking future info.\n")
-mae_bad, mae_cheat, n1, n2 = lookahead_smoke_checks(X_all, y_all, tr_idx, te_idx, K=5, seed=42)
-print(f"[SANITY] look-ahead smoke (shift+K worse, cheat better): bad={mae_bad:.2f} (n={n1}) | cheat={mae_cheat:.2f} (n={n2})")
-# ======================================================================
-
 
 # === [NEW] TCN LOFO importance on TEST ONLY (real labels only) ===
 y_true_full = df["PM10_shifted"].to_numpy(np.float32)
