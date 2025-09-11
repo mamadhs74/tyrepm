@@ -569,6 +569,9 @@ feat_cols_for_model = list(SELECTED)
 TARGETS = ["PM1_shifted","PM2_5_shifted","PM10_shifted"]
 PRETTY  = {"PM1_shifted":"PM₁","PM2_5_shifted":"PM₂.₅","PM10_shifted":"PM₁₀"}
 UNIT    = "µg/m³"
+# TARGETS / PRETTY / UNIT already defined above
+assert all(t in ALL_TARGETS for t in TARGETS)
+
 
 # --- ENGINE TORQUE UTILIZATION & POWER ESTIMATION ---
 
@@ -1130,9 +1133,14 @@ PREDICTORS = [c for c in PREDICTORS if c in df.columns]
 TEACH_PREDICTORS = [c for c in feat_cols_for_model if c in df.columns]
 
 
-TARGETS = ["PM1_shifted", "PM2_5_shifted", "PM10_shifted"]
-PRETTY  = dict(zip(TARGETS, ["PM₁", "PM₂.₅", "PM₁₀"]))
-UNIT    = "µg/m³"
+# === canonical target config (define ONCE) ===
+ALL_TARGETS = ["PM1_shifted", "PM2_5_shifted", "PM10_shifted"]
+PRETTY_MAP  = {"PM1_shifted":"PM₁", "PM2_5_shifted":"PM₂.₅", "PM10_shifted":"PM₁₀"}
+UNIT        = "µg/m³"
+
+TARGETS = [t for t in ALL_TARGETS if t in df.columns]
+PRETTY  = {t: PRETTY_MAP[t] for t in TARGETS}
+# =============================================
 
 
 # ── Optuna per-target tuning (with time gap) ─────────────────────────
@@ -1643,42 +1651,36 @@ ssl_loss  = nn.MSELoss()
 
 encoder.train(); ssl_head.train()
 SSL_EPOCHS = 15
-for e in range(1, SSL_EPOCHS + 1):
-    running = 0.0
-    for xb, yb in ssl_loader:
-        xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-        # light denoising by random masking (improves robustness)
-        with torch.no_grad():
-            mask = (torch.rand_like(xb) < 0.03).float()
-            xb = xb * (1 - mask)
 
-        ssl_optim.zero_grad()
-        z    = encoder(xb)
-        yhat = ssl_head(z)                           # both (B, F)
-        with torch.no_grad():
-            M = (torch.rand_like(yhat) < MASK_RATE).float()
-        loss = ((yhat - yb)**2 * M).sum() / (M.sum() + 1e-8)
+if len(ssl_loader) == 0:
+    print("[SSL] skipped: sequence too short for SSL windows.")
+else:
+    for e in range(1, SSL_EPOCHS + 1):
+        running = 0.0
+        for xb, yb in ssl_loader:
+            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
 
-        loss.backward()
-        clip_grad_norm_(list(encoder.parameters()) + list(ssl_head.parameters()), 1.0)
-        ssl_optim.step()
-        running += loss.item()
-        ssl_train = TensorDataset(X_ssl[:ssl_split], Y_ssl[:ssl_split])
-        ssl_loader = DataLoader(ssl_train, batch_size=64, shuffle=True)
+            # light denoising: random masking
+            with torch.no_grad():
+                mask = (torch.rand_like(xb) < 0.03).float()
+                xb = xb * (1 - mask)
 
-        if len(ssl_train) == 0:
-            print("[SSL] skipped: sequence too short for SSL windows.")
-        else:
-            encoder.train(); ssl_head.train()
-            SSL_EPOCHS = 15
-            for e in range(1, SSL_EPOCHS + 1):
-                running = 0.0
-                for xb, yb in ssl_loader:
-                    ...
-                    running += loss.item()
-                print(f"[SSL] epoch {e:02d}  loss={running/max(1, len(ssl_loader)):.4f}")
+            ssl_optim.zero_grad()
+            z    = encoder(xb)
+            yhat = ssl_head(z)
 
-        
+            # score only masked dims
+            with torch.no_grad():
+                M = (torch.rand_like(yhat) < MASK_RATE).float()
+            loss = ((yhat - yb)**2 * M).sum() / (M.sum() + 1e-8)
+
+            loss.backward()
+            clip_grad_norm_(list(encoder.parameters()) + list(ssl_head.parameters()), 1.0)
+            ssl_optim.step()
+            running += loss.item()
+
+        print(f"[SSL] epoch {e:02d}  loss={running/max(1, len(ssl_loader)):.4f}")
+
 
 # keep the pretrained weights; we won't use ssl_head anymore
 # ================================================================
