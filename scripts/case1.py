@@ -566,12 +566,6 @@ feat_cols_for_model = list(SELECTED)
 
 
 
-TARGETS = ["PM1_shifted","PM2_5_shifted","PM10_shifted"]
-PRETTY  = {"PM1_shifted":"PM₁","PM2_5_shifted":"PM₂.₅","PM10_shifted":"PM₁₀"}
-UNIT    = "µg/m³"
-# TARGETS / PRETTY / UNIT already defined above
-assert all(t in ALL_TARGETS for t in TARGETS)
-
 
 # --- ENGINE TORQUE UTILIZATION & POWER ESTIMATION ---
 
@@ -947,6 +941,14 @@ PRETTY  = {"PM1_shifted":"PM₁","PM2_5_shifted":"PM₂.₅","PM10_shifted":"PM�
 PRETTY  = {k: v for k, v in PRETTY.items() if k in TARGETS}
 UNIT    = "µg/m³"
 # === end robust PM block ===
+# === canonical target config (define ONCE, right after robust PM block) ===
+ALL_TARGETS = ["PM1_shifted", "PM2_5_shifted", "PM10_shifted"]
+PRETTY_MAP  = {"PM1_shifted":"PM₁", "PM2_5_shifted":"PM₂.₅", "PM10_shifted":"PM₁₀"}
+UNIT        = "µg/m³"
+
+TARGETS = [t for t in ALL_TARGETS if t in df.columns]
+PRETTY  = {t: PRETTY_MAP[t] for t in TARGETS}
+# ========================================================================
 
 
 # slip-ratio, gear extras (unchanged from original) ---------------------------
