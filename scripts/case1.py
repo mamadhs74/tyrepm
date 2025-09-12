@@ -15,7 +15,9 @@ from torch.utils.data import DataLoader, TensorDataset
 from collections import defaultdict
 from pathlib import Path                   
 from torch.nn.utils import clip_grad_norm_  
-import torch.nn.functional as F  # for SmoothL1 (Huber) loss                    
+import torch.nn.functional as F  # for SmoothL1 (Huber) loss 
+from datetime import datetime
+
 
 try:
     from filterpy.kalman import ExtendedKalmanFilter
@@ -2419,6 +2421,90 @@ with open(os.path.join(SANITY_DIR, "slice_report.txt"), "w") as f:
     f.write(f"TEST MAE (<10 km/h): {mae_test_low:.3f}\n")
     f.write(f"TEST MAE (>=10 km/h): {mae_test_high:.3f}\n")
 
+# ---------------- MODEL REGISTRY ----------------
+def _git_commit_or_env():
+    env = os.getenv("GIT_COMMIT")
+    if env:
+        return env
+    try:
+        import subprocess
+        return subprocess.check_output(["git","rev-parse","--short","HEAD"],
+                                       stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        return "local"
+
+def register_model_version(model_path, metrics, metadata):
+    """Append a row to model_registry.csv with key metrics + lineage."""
+    registry_path = "model_registry.csv"
+    entry = {
+        "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "model_path": model_path,
+        "test_mae": metrics.get("test_mae", np.nan),
+        "test_mae_low_speed": metrics.get("test_mae_low_speed", np.nan),
+        "test_mae_high_speed": metrics.get("test_mae_high_speed", np.nan),
+        "coverage_90_qabs": metrics.get("q90_abs", np.nan),
+        "conformal_cov_test": metrics.get("cov_test", np.nan),
+        "data_sha": metadata.get("data_sha", ""),
+        "win": metadata.get("win", None),
+        "seed": metadata.get("seed", None),
+        "git_commit": _git_commit_or_env()
+    }
+    if Path(registry_path).exists():
+        df_reg = pd.read_csv(registry_path)
+        df_reg = pd.concat([df_reg, pd.DataFrame([entry])], ignore_index=True)
+    else:
+        df_reg = pd.DataFrame([entry])
+    df_reg.to_csv(registry_path, index=False)
+    print(f"[REGISTRY] recorded {model_path} → {registry_path}")
+
+# --- call after metrics are available ---
+metrics = {
+    "test_mae": float(mae_test) if np.isfinite(mae_test) else np.nan,
+    "test_mae_low_speed": float(mae_test_low) if np.isfinite(mae_test_low) else np.nan,
+    "test_mae_high_speed": float(mae_test_high) if np.isfinite(mae_test_high) else np.nan,
+    "q90_abs": float(q90) if "q90" in locals() and np.isfinite(q90) else np.nan,
+    "cov_test": float(cov) if "cov" in locals() and np.isfinite(cov) else np.nan,
+}
+metadata = {"data_sha": _data_sha, "win": int(WIN), "seed": int(SEED)}
+register_model_version("tcn_pm10_gated.pth", metrics, metadata)
+
+# ---------- FAIRNESS: regime-wise errors (TEST · REAL labels only) ----------
+
+def analyze_fairness_by_regime(df, predictions, true_values, mask):
+    results = []
+    regimes = sorted(pd.Series(df["regime"]).dropna().unique().tolist())
+    vcol = "KO1_[km\\h]" if "KO1_[km\\h]" in df.columns else ("KO1_[km/h]" if "KO1_[km/h]" in df.columns else None)
+    for reg in regimes:
+        m = (df["regime"].to_numpy() == reg) & mask
+        if int(m.sum()) >= 20:
+            row = {
+                "regime": int(reg),
+                "n_samples": int(m.sum()),
+                "mae": float(mean_absolute_error(true_values[m], predictions[m]))
+            }
+            if vcol:
+                row["mean_speed"] = float(pd.to_numeric(df.loc[m, vcol], errors="coerce").mean())
+            results.append(row)
+    if not results:
+        return pd.DataFrame(columns=["regime","n_samples","mae","mean_speed"])
+    return pd.DataFrame(results).sort_values("mae", ascending=False)
+
+# base TEST mask already available from earlier code
+fair_mask = (test_rows
+             & y_mask_real
+             & np.isfinite(y_true_full)
+             & np.isfinite(y_pred_full))
+
+df_fair = analyze_fairness_by_regime(df, y_pred_full, y_true_full, fair_mask)
+Path("ml_charts/diagnostics").mkdir(parents=True, exist_ok=True)
+df_fair.to_csv("ml_charts/diagnostics/fairness_by_regime.csv", index=False)
+
+overall_mae = float(mean_absolute_error(y_true_full[fair_mask], y_pred_full[fair_mask])) if fair_mask.any() else np.nan
+disparity   = float(df_fair["mae"].max() - df_fair["mae"].min()) if not df_fair.empty else np.nan
+pd.DataFrame([{"overall_mae": overall_mae, "regime_range_mae": disparity}])\
+  .to_csv("ml_charts/diagnostics/fairness_summary.csv", index=False)
+print(f"[FAIR] overall MAE={overall_mae:.3f} · regime range={disparity:.3f}")
+
 # --- 4) Target-permutation smoke test (time-series split with gap)
 try:
     fold_lo = int(0.65 * len(df))
@@ -2560,6 +2646,32 @@ for f in SELECTED:
 
 pd.DataFrame(psi_rows).sort_values("psi_train_vs_test", ascending=False)\
   .to_csv(os.path.join(SANITY_DIR, "feature_drift_psi.csv"), index=False)
+# ---------------- DRIFT MONITORING (PSI) ----------------
+def monitor_feature_drift(new_data, reference_data, features, threshold=0.2):
+    """Return a DataFrame of PSI with status OK/WARN/ALERT."""
+    rows = []
+    for f in features:
+        try:
+            p = psi(reference_data[f].dropna().to_numpy(),
+                    new_data[f].dropna().to_numpy())
+        except Exception:
+            p = np.nan
+        status = "OK"
+        if np.isfinite(p):
+            if p > threshold:
+                status = "ALERT"
+            elif p > threshold/2:
+                status = "WARN"
+        rows.append({"feature": f, "psi": float(p) if np.isfinite(p) else np.nan, "status": status})
+    return pd.DataFrame(rows).sort_values("psi", ascending=False)
+
+# reference = training distribution; new_data = latest rows (or test slice)
+ref_feat = df.loc[train_rows, SELECTED].copy()
+new_feat = df.loc[df.index.max()-2000: df.index.max(), SELECTED].copy() if len(df) > 2000 else df[SELECTED].copy()
+
+drift_df = monitor_feature_drift(new_feat, ref_feat, SELECTED, threshold=0.2)
+drift_df.to_csv("ml_charts/diagnostics/drift_alerts.csv", index=False)
+print("[DRIFT] top drift signals:\n", drift_df.head(10))
 
 # === [NEW] TCN LOFO importance on TEST ONLY (real labels only) ===
 y_true_full = df["PM10_shifted"].to_numpy(np.float32)
