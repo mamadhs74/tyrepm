@@ -47,11 +47,26 @@ try:
 except Exception:
     HAS_OPTUNA = False
 
+    
+try:
+    import pandera as pa
+    from pandera import Column, DataFrameSchema, Check
+    HAS_PANDERA = True
+except Exception:
+    HAS_PANDERA = False
+
 # Optional switch for basemaps (needs internet & contextily)
 USE_BASEMAPS = False
 
+PRIVACY_STRICT = True  # treat raw coordinates as PII in saved artifacts
+
 # ====== NaN/Inf tripwires (add once, near imports) ======
 from contextlib import contextmanager
+# ---- tiny control-flow exception used to skip a bad batch safely ----
+class SkipBatch(RuntimeError):
+    """Signal to skip the current batch without stopping training."""
+    pass
+
 
 def register_nan_hooks(module: torch.nn.Module, name="model"):
     def _fwd_hook(mod, inp, out):
@@ -60,7 +75,9 @@ def register_nan_hooks(module: torch.nn.Module, name="model"):
         bad_in = any(_check(t) for t in (inp if isinstance(inp, (tuple, list)) else [inp]))
         bad_out = any(_check(t) for t in (out if isinstance(out, (tuple, list)) else [out]))
         if bad_in or bad_out:
-            raise RuntimeError(f"[NaNGuard] Non-finite in {name}:{mod.__class__.__name__} (forward)")
+            print(f"[NaNGuard] Non-finite in {name}:{mod.__class__.__name__} (forward) — skipping batch")
+            raise SkipBatch("skip_batch")
+
     def _bwd_hook(mod, grad_input, grad_output):
         def _check(t):
             return t is not None and isinstance(t, torch.Tensor) and (not torch.isfinite(t).all())
@@ -267,12 +284,18 @@ else:
         model.set_params(monotone_constraints=mono)
 
         early_stop = lgb.early_stopping(1000, first_metric_only=True, verbose=False)
+        # Embargo: keep a temporal gap between train and in-fold validation
+        gap = int(globals().get("WIN", 128))  # falls back if WIN not defined yet
+        val_start = int(0.8 * len(X_tr))
+        tr_end = max(1, min(val_start - gap, len(X_tr) - 1))
+
         model.fit(
-            X_tr, y_tr,
-            eval_set=[(X_val, y_val)],
+            X_tr.iloc[:tr_end], y_tr.iloc[:tr_end],
+            eval_set=[(X_val, y_val)],  # keep val as-is; gap is on the train side
             eval_metric="l2",
             callbacks=[early_stop]
         )
+
 
         # return a sanitized view aligned to what the model saw (for permutation_importance)
         X_safe = X[non_const].copy()
@@ -459,6 +482,9 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+# Stronger determinism (document CUDA/cuDNN versions in your run manifest)
+torch.use_deterministic_algorithms(True)
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -466,6 +492,15 @@ print("🔌  using", DEVICE.upper())
 
 # ——————————————————————————————————————— 1. load data
 df = pd.read_csv("1.csv")
+# Snapshot the raw data file for lineage
+import hashlib, json, pathlib
+_data_p = pathlib.Path("1.csv")
+_data_sha = hashlib.sha256(_data_p.read_bytes()).hexdigest()
+pathlib.Path("ml_charts/diagnostics").mkdir(parents=True, exist_ok=True)
+pathlib.Path("ml_charts/diagnostics/dataset_hash.json").write_text(
+    json.dumps({"file": str(_data_p), "sha256": _data_sha}, indent=2)
+)
+
 TICK_RATE            = 0.1     # logger tick [s]
 # Ensure a time axis exists for downstream slicing/plots
 if "X_Achse_[s]" not in df.columns:
@@ -562,10 +597,7 @@ FEATURE_UNITS.update({"Heading_rate_[deg_s]": "°/s", "Curvature_[1_m]": "1/m"})
 
 # === Define model feature list once (after SELECTED + EXTRA_FEATS are final)
 feat_cols_for_model = list(SELECTED)
-
-
-
-
+SELECTED_IDX = {c: i for i, c in enumerate(SELECTED)}
 
 # --- ENGINE TORQUE UTILIZATION & POWER ESTIMATION ---
 
@@ -638,7 +670,8 @@ if {"Latitude", "Longitude"}.issubset(df.columns):
             df["Heading_deg"] = df["True_Heading_[Grad]"].astype(float)
         else:
             df["Heading_deg"] = np.rad2deg(np.arctan2(dy, dx))
-            df["Heading_deg"] = df["Heading_deg"].bfill().fillna(0.0)
+            df["Heading_deg"] = df["Heading_deg"].ffill().fillna(0.0)  # strictly past-only
+
     df["Heading_unwrapped"] = np.unwrap(np.deg2rad(df["Heading_deg"]))
 
     # EKF / fallback smoothing
@@ -984,6 +1017,14 @@ df[feat_cols_for_model] = (
       .ffill()
       .fillna(0.0)
 )
+
+if HAS_PANDERA:
+    schema = DataFrameSchema({
+        c: Column(float, nullable=False) for c in feat_cols_for_model
+    })
+    # will raise with a clear error if schema/units go off-spec
+    _ = schema.validate(df[feat_cols_for_model], lazy=True)
+
 # ================================================================
 
 # cluster regimes -------------------------------------------------------------
@@ -1135,11 +1176,6 @@ PREDICTORS = [c for c in PREDICTORS if c in df.columns]
 TEACH_PREDICTORS = [c for c in feat_cols_for_model if c in df.columns]
 
 
-# === canonical target config (define ONCE) ===
-ALL_TARGETS = ["PM1_shifted", "PM2_5_shifted", "PM10_shifted"]
-PRETTY_MAP  = {"PM1_shifted":"PM₁", "PM2_5_shifted":"PM₂.₅", "PM10_shifted":"PM₁₀"}
-UNIT        = "µg/m³"
-
 TARGETS = [t for t in ALL_TARGETS if t in df.columns]
 PRETTY  = {t: PRETTY_MAP[t] for t in TARGETS}
 # =============================================
@@ -1214,9 +1250,11 @@ def make_objective(tgt_name: str):
 
             # in-fold split for early stopping
             val_split = max(1, min(int(0.8 * len(X_tr)), len(X_tr) - 1))
+            gap = int(globals().get("WIN", 128))
+            tr_end = max(1, min(val_split - gap, len(X_tr) - 1))
             early = lgb.early_stopping(100, verbose=False)
             model.fit(
-                X_tr.iloc[:val_split], y_tr.iloc[:val_split],
+                X_tr.iloc[:tr_end], y_tr.iloc[:tr_end],
                 eval_set=[(X_tr.iloc[val_split:], y_tr.iloc[val_split:])],
                 eval_metric="l2",
                 callbacks=[early]
@@ -1516,7 +1554,6 @@ def plot_overlay(df, out="ml_charts/diagnostics/raw_vs_ekf.png"):
     print("🗺️  overlay map saved →", out)
 
 
-plot_overlay(df)
 
 #ßßßßßßßßßßßßßßßßßßßß
 
@@ -1837,105 +1874,110 @@ for epoch in range(1, EPOCHS + 1):
         train_batches = 0
 
         for xb, yb, wb, xb_next in train_loader:
+            try:
+                # 1) move to device FIRST (and sanitize) so aug runs on GPU
+                xb      = torch.nan_to_num(xb).to(DEVICE, non_blocking=True)
+                yb      = torch.nan_to_num(yb).to(DEVICE, non_blocking=True)
+                wb      = torch.nan_to_num(wb).to(DEVICE, non_blocking=True)
+                xb_next = torch.nan_to_num(xb_next).to(DEVICE, non_blocking=True)
 
-            # (A) augmentation — training only
-            if (not AUG_DISABLED) and pm_model.training:
-                scale = aug_scale(epoch) if 'aug_scale' in globals() else 1.0
-                aug_idx = [SELECTED.index(c) for c in AUG_COLS if c in SELECTED]
+                # 2) augmentation — training only (now on GPU)
+                if (not AUG_DISABLED) and pm_model.training:
+                    scale = aug_scale(epoch) if 'aug_scale' in globals() else 1.0
+                    aug_idx = [SELECTED.index(c) for c in AUG_COLS if c in SELECTED]
+                    with torch.no_grad():
+                        # generic masked Gaussian noise on selected features
+                        if aug_idx and AUG_NOISE_STD > 0:
+                            mask = torch.zeros(1, 1, xb.size(-1), device=xb.device)
+                            mask[..., aug_idx] = 1.0
+                            xb.add_(mask * torch.randn_like(xb) * (AUG_NOISE_STD * scale))
 
+                        # KO1-only jitter (handle both name spellings)
+                        ko1_name = "KO1_[km/h]" if "KO1_[km/h]" in SELECTED else "KO1_[km\\h]"
+                        if JITTER_KO1 and (ko1_name in SELECTED) and KO1_JITTER_STD > 0:
+                            j = SELECTED.index(ko1_name)
+                            xb[..., j].add_(KO1_JITTER_STD * scale * torch.randn_like(xb[..., j]))
+
+                # 3) forward + losses
+                optim.zero_grad(set_to_none=True)
+
+                pred_z, g, recon = pm_model(xb, return_ssl=True)
+                pred_z = torch.nan_to_num(pred_z)
+                recon  = torch.nan_to_num(recon)
+
+                num_real  += int((wb > 0.5).sum().item())
+                num_total += int(wb.numel())
+
+                # speed-aware weighting
+                speed_idx = SELECTED_IDX.get("KO1_[km/h]", SELECTED_IDX.get("KO1_[km\\h]"))
+                if speed_idx is not None:
+                    v_last = xb[:, -1, speed_idx]
+                    mu, sigma = x_scaler.mean_[speed_idx], x_scaler.scale_[speed_idx]
+                    v_kmh = (v_last * sigma + mu)
+                    v_kmh = torch.clamp(v_kmh, 0.0, 200.0)  # clamp to avoid extreme weights
+                    w_speed = torch.clamp(1.0 + (10.0 - v_kmh) / 10.0, 1.0, 2.0)
+                else:
+                    w_speed = torch.ones_like(wb)
+
+                # combine mask + speed weights
+                w_eff = wb * w_speed
+                if w_eff.sum() < 1e-6:
+                    w_eff = torch.ones_like(w_eff) * 0.1  # weak fallback
+
+                per_elem = F.smooth_l1_loss(pred_z, yb, beta=1.0, reduction="none")
+                sup_loss = (w_eff * per_elem).sum() / (w_eff.sum() + 1e-8)
+
+                # SSL: score only masked dims
                 with torch.no_grad():
-                    # generic masked Gaussian noise on a few features
-                    if aug_idx and AUG_NOISE_STD > 0:
-                        mask = torch.zeros(1, 1, n_feat, device=xb.device)
-                        mask[..., aug_idx] = 1.0
-                        xb.add_(mask * torch.randn_like(xb) * (AUG_NOISE_STD * scale))
+                    M = (torch.rand_like(recon) < MASK_RATE).float()
+                ssl_recon_loss = ((recon - xb_next)**2 * M).sum() / (M.sum() + 1e-8)
 
-                    # KO1-only jitter
-                    if JITTER_KO1 and ("KO1_[km\\h]" in SELECTED) and KO1_JITTER_STD > 0:
-                        j = SELECTED.index("KO1_[km\\h]")
-                        xb[..., j].add_(KO1_JITTER_STD * scale * torch.randn_like(xb[..., j]))
+                gate_loss = L1_GATES * g.clamp_max(10).mean()
+                alpha_ssl = ssl_weight(epoch, total=EPOCHS)
+                loss = sup_loss + alpha_ssl * ssl_recon_loss + gate_loss
 
+                if not torch.isfinite(loss):
+                    xb_mean = float(torch.nan_to_num(xb).mean())
+                    xb_std  = float(torch.nan_to_num(xb).std())
+                    yb_mean = float(torch.nan_to_num(yb).mean())
+                    yb_std  = float(torch.nan_to_num(yb).std())
+                    print(f"[SKIP] non-finite loss. xb μ±σ={xb_mean:.3f}±{xb_std:.3f}  y μ±σ={yb_mean:.3f}±{yb_std:.3f}")
+                    optim.zero_grad(set_to_none=True)
+                    continue
 
+                # 4) backward + step
+                loss.backward()
+                preclip = clip_grad_norm_(pm_model.parameters(), 1.0)
 
+                # gradient logging (unchanged)
+                step_i += 1
+                if step_i % GRAD_LOG_EVERY == 0:
+                    import re
+                    keep = set()
+                    for pat in TRACKED_PARAM_PATTERNS:
+                        rx = re.compile(pat)
+                        for name, param in pm_model.named_parameters():
+                            if param.grad is not None and rx.search(name):
+                                keep.add(name)
+                    for name, param in pm_model.named_parameters():
+                        if name in keep and param.grad is not None:
+                            grad_history[name].append(param.grad.data.norm(2).item())
+                    grad_history["__global__"].append(float(preclip))
 
-            xb, yb, wb = xb.to(DEVICE), yb.to(DEVICE), wb.to(DEVICE)
-            xb = torch.nan_to_num(xb); yb = torch.nan_to_num(yb)
+                optim.step()
 
-            optim.zero_grad()
-            pred_z, g, recon = pm_model(xb, return_ssl=True)
-            pred_z = torch.nan_to_num(pred_z); recon = torch.nan_to_num(recon)
+                # accumulate batch losses
+                epoch_sup   += float(sup_loss)
+                epoch_ssl   += float(ssl_recon_loss)
+                epoch_gate  += float(gate_loss)
+                epoch_total += float(loss)
+                train_batches += 1
 
-            num_real  += int((wb > 0.5).sum().item())
-            num_total += int(wb.numel())
-            # --- speed-aware weighting (upweight near-idle scenarios)
-            speed_idx = SELECTED.index("KO1_[km\\h]") if "KO1_[km\\h]" in SELECTED else None
-            if speed_idx is not None:
-                # last step speed in the window (z-scored units here)
-                v_last = xb[:, -1, speed_idx]
-                # convert back to approx km/h scale using scaler stats
-                mu, sigma = x_scaler.mean_[speed_idx], x_scaler.scale_[speed_idx]
-                v_kmh = (v_last * sigma + mu)
-                # weight: emphasize <10 km/h (clip to [1, 2])
-                w_speed = torch.clamp(1.0 + (10.0 - v_kmh) / 10.0, 1.0, 2.0)
-            else:
-                w_speed = torch.ones_like(wb)
-
-            # combine with label mask
-            # combine with label mask and speed weighting
-            w_eff = wb * w_speed  # shape (B,)
-
-            # fallback if a batch has no supervised signal at all
-            if w_eff.sum() < 1e-6:
-                w_eff = torch.ones_like(w_eff) * 0.1  # weak supervision fallback
-
-            per_elem = F.smooth_l1_loss(pred_z, yb, beta=1.0, reduction="none")
-            sup_loss = (w_eff * per_elem).sum() / (w_eff.sum() + 1e-8)
-
-            # ---- Masked Feature Modeling (score only masked feature dims) ----
-            xb_next_ = xb_next.to(DEVICE)                 # (B, F)
-            with torch.no_grad():
-                M = (torch.rand_like(recon) < MASK_RATE).float()  # (B, F)
-            ssl_recon_loss = ((recon - xb_next_)**2 * M).sum() / (M.sum() + 1e-8)
-            # ---------------------------------------------------------------
-
-            gate_loss = L1_GATES * g.abs().mean()
-
-            alpha_ssl = ssl_weight(epoch, total=EPOCHS)
-            loss = sup_loss + alpha_ssl * ssl_recon_loss + gate_loss
-
-            if not torch.isfinite(loss):
-                xb_mean = float(torch.nan_to_num(xb).mean())
-                xb_std  = float(torch.nan_to_num(xb).std())
-                yb_mean = float(torch.nan_to_num(yb).mean())
-                yb_std  = float(torch.nan_to_num(yb).std())
-                print(f"[SKIP] non-finite loss. xb μ±σ={xb_mean:.3f}±{xb_std:.3f}  y μ±σ={yb_mean:.3f}±{yb_std:.3f}")
+            except SkipBatch:
+                # clear any partial state and skip this batch safely
+                optim.zero_grad(set_to_none=True)
                 continue
 
-            loss.backward()
-            preclip = clip_grad_norm_(pm_model.parameters(), 1.0)
-
-            # gradient logging (unchanged)
-            step_i += 1
-            if step_i % GRAD_LOG_EVERY == 0:
-                import re
-                keep = set()
-                for pat in TRACKED_PARAM_PATTERNS:
-                    rx = re.compile(pat)
-                    for name, param in pm_model.named_parameters():
-                        if param.grad is not None and rx.search(name):
-                            keep.add(name)
-                for name, param in pm_model.named_parameters():
-                    if name in keep and param.grad is not None:
-                        grad_history[name].append(param.grad.data.norm(2).item())
-                grad_history["__global__"].append(float(preclip))
-
-            optim.step()  
-            # accumulate batch losses
-            epoch_sup   += float(sup_loss)
-            epoch_ssl   += float(ssl_recon_loss)
-            epoch_gate  += float(gate_loss)
-            epoch_total += float(loss)
-            train_batches += 1
 
 
 
@@ -2036,6 +2078,18 @@ plt.savefig("ml_charts/diagnostics/loss_curves_total.png", dpi=300); plt.close()
 
 torch.save(pm_model.state_dict(), "tcn_pm10_gated.pth")
 
+import platform, pip, json, time
+manifest = {
+    "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+    "python": platform.python_version(),
+    "platform": platform.platform(),
+    "seeds": {"SEED": SEED},
+    "win": int(WIN),
+    "env": sorted([f"{p.project_name}=={p.version}" for p in pip.get_installed_distributions()])[:200],
+    "data_sha256": _data_sha,
+}
+Path("ml_charts/diagnostics").mkdir(parents=True, exist_ok=True)
+Path("ml_charts/diagnostics/run_manifest.json").write_text(json.dumps(manifest, indent=2))
 
 # --------------------------------------------------------------
 TRAIN_WIN = WIN 
@@ -2046,7 +2100,16 @@ MODEL_PM = pm_model.eval() # finished network
 
 
 @torch.no_grad()
-def tcn_predict_series(df_src: pd.DataFrame, feature_cols=SELECTED, win=TRAIN_WIN):
+def tcn_predict_series(df_src: pd.DataFrame,
+                       feature_cols=SELECTED,
+                       win=TRAIN_WIN,
+                       model=None):
+    """
+    Predict full-series next-step target with a given model.
+    If model is None, uses MODEL_PM (the frozen/eval copy).
+    """
+    model = MODEL_PM if model is None else model
+
     # 1) same preprocessing as training
     feats = df_src[feature_cols].fillna(0).to_numpy(np.float32)
     feats = SCALER.transform(feats)
@@ -2061,13 +2124,14 @@ def tcn_predict_series(df_src: pd.DataFrame, feature_cols=SELECTED, win=TRAIN_WI
     ds = DataLoader(TensorDataset(torch.from_numpy(X_tmp)), batch_size=256, shuffle=False)
 
     # 3) run model and inverse-scale
-    pred_z = torch.cat([MODEL_PM(b.to(DEVICE))[0].cpu() for (b,) in ds]).numpy()
+    pred_z = torch.cat([model(b.to(DEVICE))[0].cpu() for (b,) in ds]).numpy()
     pred   = Y_SCALER.inverse_transform(pred_z.reshape(-1, 1)).ravel()
 
     # 4) write predictions at indices [win :] (because label is at i+win)
     full = np.full(len(df_src), np.nan, dtype=float)
     full[win:] = pred
     return full
+
 pred_full = tcn_predict_series(df, feature_cols=SELECTED, win=TRAIN_WIN)
 _idx = np.flatnonzero(np.isfinite(pred_full))
 print("first finite pred index:", int(_idx[0]) if len(_idx) else "none")
@@ -2192,9 +2256,24 @@ with open(csv_path, "a", encoding="utf-8") as f:
     f.write(f"{int(EXPERIMENT_SSL)},{SEED},{mae_test:.6f}\n")
 
 print(f"[SSL_ABL] ssl={EXPERIMENT_SSL} seed={SEED}  REAL-ONLY test MAE={mae_test:.3f}")
+# --- Conformal PI using the validation split as calibration ---
+with torch.no_grad():
+    cal_pred_z = torch.cat([MODEL_PM(b_x.to(DEVICE))[0] for (b_x, _, _, _) in val_loader])
+    cal_true_z = torch.cat([b_y.to(DEVICE)             for (_, b_y, _, _) in val_loader])
 
+cal_pred = Y_SCALER.inverse_transform(cal_pred_z.cpu().numpy().reshape(-1,1)).ravel()
+cal_true = Y_SCALER.inverse_transform(cal_true_z.cpu().numpy().reshape(-1,1)).ravel()
+cal_res  = cal_true - cal_pred
 
+# 90% symmetric interval
+q90 = float(np.quantile(np.abs(cal_res[np.isfinite(cal_res)]), 0.90))
 
+test_lo, test_hi = pm_pred - q90, pm_pred + q90
+cov = float(np.mean((pm_true >= test_lo) & (pm_true <= test_hi)))
+Path("ml_charts/diagnostics").mkdir(parents=True, exist_ok=True)
+with open("ml_charts/diagnostics/calibration_report.txt", "w") as f:
+    f.write(f"Conformal |q| 0.90 = {q90:.3f}\n")
+    f.write(f"Empirical coverage on TEST = {cov:.3%}\n")
 
 # ================================================
 
@@ -2210,18 +2289,6 @@ if "PM10_shifted" in gb_metrics:
     else:
         print("[ERROR] all TCN predictions are non-finite; check training logs.")
 
-# Map predictions to their original row positions
-win, horizon = TRAIN_WIN, 1
-n_rows = len(df)
-target_pos = np.arange(win + horizon - 1, n_rows)  # positions with labels
-pm10_hat_full = np.full(n_rows, np.nan, dtype=float)
-pm10_hat_full[target_pos[-len(pm_pred):]] = pm_pred  # align tail to test set
-
-df_pred = df.copy()
-df_pred["PM10_hat"] = pm10_hat_full
-for col in ["PM1_hat", "PM2_5_hat"]:
-    if col not in df_pred.columns:
-        df_pred[col] = np.nan
 
 def audit_coverage(df_src, df_pred_src, WIN, test_frac=0.2):
     T = len(df_src)
@@ -2241,7 +2308,14 @@ def audit_coverage(df_src, df_pred_src, WIN, test_frac=0.2):
     print(f"[COVERAGE] preds (full series)  : {n_pred_full}")
 
 # ---- Full-drive predictions from WIN-1 onward (no skipping after warmup)
+# ---- Full-drive predictions from WIN-1 onward (no skipping after warmup)
+df_pred = df.copy()  # add this if df_pred no longer exists
 df_pred["PM10_hat_all"] = tcn_predict_series(df, feature_cols=SELECTED, win=TRAIN_WIN)
+df_pred["PM10_hat"] = df_pred["PM10_hat_all"]  # keep legacy name for plots
+for col in ["PM1_hat", "PM2_5_hat"]:
+    if col not in df_pred.columns:
+        df_pred[col] = np.nan
+
 audit_coverage(df, df_pred, WIN)
 
 # ========================= SANITY CHECK SUITE =========================
@@ -2334,6 +2408,16 @@ with open(os.path.join(SANITY_DIR, "baseline_report.txt"), "w", encoding="utf-8"
     f.write(f"  TCN: {mae_test:.3f}\n")
 
 print(f"[SANITY] TEST baselines — persistence: {mae_persist_test:.2f}  rolling: {mae_roll_test:.2f}")
+
+# Low-speed slice on TEST (<10 km/h)
+v_kmh = df["KO1_[km\\h]"].to_numpy(np.float32)
+low_speed = v_kmh < 10.0
+mae_test_low = safe_mae(y_true_full, y_pred_full, test_rows & y_mask_real & low_speed)
+mae_test_high = safe_mae(y_true_full, y_pred_full, test_rows & y_mask_real & (~low_speed))
+
+with open(os.path.join(SANITY_DIR, "slice_report.txt"), "w") as f:
+    f.write(f"TEST MAE (<10 km/h): {mae_test_low:.3f}\n")
+    f.write(f"TEST MAE (>=10 km/h): {mae_test_high:.3f}\n")
 
 # --- 4) Target-permutation smoke test (time-series split with gap)
 try:
@@ -2457,6 +2541,26 @@ with open(os.path.join(SANITY_DIR, "lookahead_smoke.txt"), "w") as f:
     f.write("This number SHOULD be noticeably BETTER than baseline; "
             "if your normal model is *similar*, you might be leaking future info.\n")
 
+
+def psi(a, b, bins=20):
+    a = a[np.isfinite(a)]; b = b[np.isfinite(b)]
+    if a.size < 5 or b.size < 5: return np.nan
+    qs = np.quantile(a, np.linspace(0, 1, bins+1))
+    ca = np.histogram(a, qs)[0] + 1e-6; ca = ca/ca.sum()
+    cb = np.histogram(b, qs)[0] + 1e-6; cb = cb/cb.sum()
+    return float(((ca - cb) * np.log(ca / cb)).sum())
+
+rows_train = train_rows
+rows_test  = test_rows
+psi_rows = []
+for f in SELECTED:
+    A = df.loc[rows_train, f].to_numpy(np.float64)
+    B = df.loc[rows_test,  f].to_numpy(np.float64)
+    psi_rows.append({"feature": f, "psi_train_vs_test": psi(A, B)})
+
+pd.DataFrame(psi_rows).sort_values("psi_train_vs_test", ascending=False)\
+  .to_csv(os.path.join(SANITY_DIR, "feature_drift_psi.csv"), index=False)
+
 # === [NEW] TCN LOFO importance on TEST ONLY (real labels only) ===
 y_true_full = df["PM10_shifted"].to_numpy(np.float32)
 y_mask_full = df["PM10_shifted_mask"].to_numpy(np.float32) > 0.5
@@ -2479,7 +2583,8 @@ def predict_with_gate_zero(feature_name: str):
     saved = pm_model.gate.log_g[idx].item()
     try:
         pm_model.gate.log_g[idx] = -20.0  # softplus(-20) ~ 0
-        return tcn_predict_series(df, feature_cols=SELECTED, win=TRAIN_WIN)
+        return tcn_predict_series(df, feature_cols=SELECTED, win=TRAIN_WIN, model=pm_model)
+
     finally:
         pm_model.gate.log_g[idx] = saved
 
