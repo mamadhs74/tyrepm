@@ -754,6 +754,34 @@ df["Curvature_[1_m]"] = (
     df["r_f"] / df["V_gps_ms"].clip(lower=0.1)
 ).replace([np.inf, -np.inf], 0.0)
 
+# ── STRATEGY SEGMENTATION (fixed windows) ─────────────────────────
+SEG_SEC = 60.0
+dt = float(TICK_RATE)
+df["seg_id"] = (df["X_Achse_[s]"] // SEG_SEC).astype(int)
+
+# helper stats per segment
+g = df.groupby("seg_id", sort=True)
+seg_feat = g.agg(
+    v_mean_kmh=("KO1_[km\\h]", "mean"),
+    v_p95_kmh =("KO1_[km\\h]", lambda s: np.percentile(s, 95)),
+    decel_p95_g=("a_long",     lambda s: np.percentile(np.maximum(-s, 0.0), 95)/9.80665),
+    latg_p95   =("a_lat",      lambda s: np.percentile(np.abs(s), 95)/9.80665),
+    stop_share =("KO1_[km\\h]", lambda s: np.mean(s < 2.0)),
+    brake_p95  =("BR5_Bremsdruck_[bar]", lambda s: np.percentile(pd.to_numeric(s, errors="coerce").fillna(0), 95))
+).reset_index()
+
+def label_strategy(r):
+    # tune thresholds if your data suggests different cutoffs
+    if r.decel_p95_g > 0.35 or r.latg_p95 > 0.35 or r.brake_p95 > 5:
+        return "sporty"
+    if r.v_mean_kmh < 15 and r.stop_share > 0.35:
+        return "traffic"
+    return "eco"
+
+seg_feat["strategy"] = seg_feat.apply(label_strategy, axis=1)
+df = df.merge(seg_feat[["seg_id","strategy"]], on="seg_id", how="left")
+df["strategy_segment"] = df["seg_id"]
+
 #--------------------------------------------------------------------------------------------------
 def plot_prediction_diagnostics(y_true, y_pred, time,
                                  tgt_name, unit, df, features):
@@ -2909,4 +2937,54 @@ except Exception as _e:
     pass
 
 # ================================================================
+# --- Physics-correct slip work (J) ---
+alpha_rad = np.deg2rad(df["Slip_Angle_[Grad]"].abs().astype(float).fillna(0.0))
+v_ms      = (df["KO1_[km\\h]"].astype(float).fillna(0.0) / 3.6)
+F_fric    = df["Friction_Force_Dynamic_[N]"].astype(float).fillna(0.0)
+
+# Slip power ~ F_tangential * slip_velocity ≈ F_fric * v * |alpha_rad|
+df["slip_power_W"] = (F_fric * v_ms * alpha_rad).clip(lower=0.0)
+
+# Integrate to Joules (strictly causal)
+df["slip_energy_J"] = (df["slip_power_W"] * TICK_RATE).cumsum()
+# ── TIRE-ONLY HEURISTIC MASK ──────────────────────────────────────
+df["decel_g"] = df["a_long"] / 9.80665
+brake_bar = pd.to_numeric(df.get("BR5_Bremsdruck_[bar]", 0.0), errors="coerce").fillna(0.0)
+
+df["tyre_only"] = (
+    (brake_bar < 0.8)                 # essentially no hydraulic braking
+    & (df["KO1_[km\\h]"] > 10.0)      # ignore crawling/idling
+    & (df["decel_g"] > -0.15)         # no hard braking phase
+)
+
+# If you want to be stricter, also require some lateral/longitudinal demand:
+df["tyre_only"] &= ((df["a_lat"].abs()/9.80665 > 0.03) | (df["a_long"].abs()/9.80665 > 0.02))
+
+
+# --- Segment-level aggregation (reduces autocorrelation bias) ---
+seg_cols = ["strategy_segment","strategy"]
+grp = df.groupby(seg_cols, sort=True)
+seg = grp.agg(
+    dist_km=("dist_km_tick","sum"),
+    slip_J=("slip_power_W", lambda s: float((s * TICK_RATE).sum())),
+    pm_exposure=("PM10_shifted", lambda s: float((pd.to_numeric(s, errors="coerce").fillna(0)*TICK_RATE).sum()))
+).reset_index()
+
+# Per-km indices
+seg = seg[seg["dist_km"] > 1e-6].copy()
+seg["slip_J_per_km"]   = seg["slip_J"] / seg["dist_km"]
+seg["expo_idx_per_km"] = seg["pm_exposure"] / seg["dist_km"]  # μg·s/m³ per km
+
+#  covariates to deconfound speed
+v_mean = df.groupby(seg_cols)["KO1_[km\\h]"].mean().reset_index().rename(columns={"KO1_[km\\h]":"v_mean_kmh"})
+seg = seg.merge(v_mean, on=seg_cols, how="left")
+
+# --- Robust linear check: exposure ~ k * slip_J_per_km (+ speed as control)
+from sklearn.linear_model import LinearRegression
+X = seg[["slip_J_per_km","v_mean_kmh"]].to_numpy()
+y = seg["expo_idx_per_km"].to_numpy()
+m = LinearRegression().fit(X, y)
+r2 = m.score(X, y)
+k  = m.coef_[0]
+print(f"[PHYS] Segment regression R²={r2:.3f}  k={k:.6e} (μg·s/m³ per J·km⁻¹), with speed control")
 
