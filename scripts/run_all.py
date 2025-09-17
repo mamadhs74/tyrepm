@@ -413,7 +413,6 @@ FEATURE_UNITS = {
     "slip_x_speed": "°·km/h",
     "slip_energy": "kJ",
     "Slip_Ratio_Avg": "",
-    "mu_final": "",
     "Fuel_Rate_Lps": "L/s",
     "Fuel_per_km": "L/km",
     "Torque_Utilization": "",
